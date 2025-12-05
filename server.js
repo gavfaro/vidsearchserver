@@ -66,20 +66,9 @@ const getOrCreateGlobalIndex = async () => {
   }
 };
 
-const startServer = async () => {
+(async () => {
   await getOrCreateGlobalIndex();
-
-  if (!GLOBAL_INDEX_ID) {
-    console.error(
-      "❌ Could not initialize index. Check API key or permissions."
-    );
-    process.exit(1);
-  }
-
-  app.listen(port, () => console.log(`🚀 VidScore Premium Engine on ${port}`));
-};
-
-startServer();
+})();
 
 // --- LAYER 1: FORENSIC AGENT (Search) ---
 // Actively hunts for bad quality footage
@@ -251,7 +240,7 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
 
     // FIX: Changed client.task.create to client.tasks.create
     const task = await client.tasks.create({
-      index_id: GLOBAL_INDEX_ID,
+      index_id: "69327898a7016957067a32ac",
       video_file: fs.createReadStream(filePath),
     });
 
