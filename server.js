@@ -19,16 +19,14 @@ app.use(cors());
 app.use(express.json());
 
 let GLOBAL_INDEX_ID = null;
-const GLOBAL_INDEX_NAME = "VidScore_Analysis";
+const GLOBAL_INDEX_NAME = "VidScore_Analysis_Premium";
 
 // --- 1. SETUP INDEX ---
 const getOrCreateGlobalIndex = async () => {
   try {
-    const indexes = await client.indexes.list();
+    const indexes = await client.index.list();
     const indexList = Array.isArray(indexes) ? indexes : indexes?.data || [];
-    const existingIndex = indexList.find(
-      (i) => i.indexName === GLOBAL_INDEX_NAME
-    );
+    const existingIndex = indexList.find((i) => i.name === GLOBAL_INDEX_NAME);
 
     if (existingIndex) {
       GLOBAL_INDEX_ID = existingIndex.id;
@@ -37,18 +35,19 @@ const getOrCreateGlobalIndex = async () => {
       );
     } else {
       console.log(
-        `Index ${GLOBAL_INDEX_NAME} not found. Creating new one with Marengo 3.0...`
+        `Index ${GLOBAL_INDEX_NAME} not found. Creating new one with Marengo 2.6 & Pegasus...`
       );
-      const newIndex = await client.indexes.create({
-        indexName: GLOBAL_INDEX_NAME,
-        models: [
+      // Ensure we use models capable of detailed search and generation
+      const newIndex = await client.index.create({
+        name: GLOBAL_INDEX_NAME,
+        engines: [
           {
-            modelName: "marengo3.0",
-            modelOptions: ["visual", "audio", "text_in_video"],
+            name: "marengo2.6",
+            options: ["visual", "conversation", "text_in_video"],
           },
           {
-            modelName: "pegasus1.2",
-            modelOptions: ["visual", "audio"],
+            name: "pegasus1.1",
+            options: ["visual", "conversation"],
           },
         ],
         addons: ["thumbnail"],
@@ -65,245 +64,262 @@ const getOrCreateGlobalIndex = async () => {
   await getOrCreateGlobalIndex();
 })();
 
-// --- 2. NICHE RULES ENGINE (HYBRID) ---
-const getNicheContext = (audience) => {
-  const normalizedAudience = audience ? audience.toLowerCase() : "general";
+// --- LAYER 1: FORENSIC AGENT (Search) ---
+// Actively hunts for bad quality footage
+const performForensicSearch = async (indexId, videoId) => {
+  const issues = [];
+  const negativeQueries = [
+    { query: "dark screen poorly lit black screen", label: "Bad Lighting" },
+    { query: "shaky camera unstable footage", label: "Unstable Camera" },
+    { query: "blurry out of focus", label: "Focus Issues" },
+    { query: "static screen loading screen", label: "Static Visuals" },
+  ];
 
-  // Hardcoded rules for high-value niches
-  const rules = {
-    "real estate": `
-      - VISUALS: Look for high-quality wide angles, smooth drone shots, or bright interior lighting.
-      - PACING: Should be elegant and smooth, not frantic.
-      - HOOK: Must show the "hero shot" (front of house or best room) immediately or overlay text with price/location.
-      - AUDIO: clear voiceover or trending luxury audio.
-      - FAILURE POINTS: Dark lighting, shaky camera, clutter in rooms.
-    `,
-    fitness: `
-      - VISUALS: Needs to show physique or movement clearly.
-      - PACING: Fast, energetic, cuts on the beat of the music.
-      - HOOK: Needs to show the "result" (the six-pack) or the "struggle" (the heavy weight) in the first second.
-      - AUDIO: High energy music or ASMR gym sounds.
-      - FAILURE POINTS: Bad form, boring rest periods left in, bad camera angle.
-    `,
-    tech: `
-      - VISUALS: Clean desk setup, clear screen recordings, high contrast.
-      - PACING: Very fast, information-dense.
-      - HOOK: Show the "cool gadget" or the "final code result" immediately.
-      - AUDIO: Crisp voiceover is mandatory. 
-      - FAILURE POINTS: Blurry screens, slow typing, monotone voice.
-    `,
-    beauty: `
-      - VISUALS: Perfect lighting (ring light), close-ups of texture.
-      - PACING: Transitions (swipes, finger snaps) are critical.
-      - HOOK: Before/After result shown instantly.
-      - FAILURE POINTS: Bad color grading, messy background.
-    `,
-    business: `
-      - VISUALS: Talking head, but must have dynamic captions.
-      - PACING: No pauses. "Millennial Pause" at start is a critical failure.
-      - HOOK: A controversial statement or a specific "How to" promise.
-      - FAILURE POINTS: looking away from camera, slow start, boring background.
-    `,
-    pets: `
-      - VISUALS: Cute close-ups, funny movements.
-      - PACING: Chaos is good.
-      - HOOK: The funny action must happen immediately.
-      - FAILURE POINTS: Human talking too much, camera too far away.
-    `,
-  };
+  console.log("   🔎 Starting Forensic Search...");
 
-  // 1. Check strict hardcoded matches
-  for (const [key, value] of Object.entries(rules)) {
-    if (normalizedAudience.includes(key)) return value;
-  }
+  // Run searches in parallel to save time
+  await Promise.all(
+    negativeQueries.map(async (item) => {
+      try {
+        const results = await client.search.query({
+          indexId: indexId,
+          queryText: item.query,
+          options: ["visual"],
+          filter: { id: [videoId] },
+        });
 
-  // 2. Dynamic Handle: User typed something specific
-  if (normalizedAudience !== "general" && normalizedAudience !== "") {
-    return `
-      - CONTEXT: The user explicitly stated this video is for the "${audience}" niche.
-      - INSTRUCTION: Use your internal knowledge of ${audience} content on social media.
-      - CRITERIA: Judge the hook, pacing, and visuals based on what currently performs well for ${audience}.
-      `;
-  }
+        // If we find a high confidence match (>75), it's a "Fact", not an opinion
+        const matches = results.data || [];
+        const bestMatch = matches[0];
 
-  // 3. Fallback
-  return `
-      - VISUALS: Clear, bright, high definition.
-      - PACING: Remove all dead air and pauses.
-      - HOOK: Visual movement or text overlay in first 3 seconds.
-  `;
+        if (bestMatch && bestMatch.score > 75) {
+          issues.push({
+            type: item.label,
+            timestamp: `${Math.floor(bestMatch.start)}s-${Math.floor(
+              bestMatch.end
+            )}s`,
+            confidence: bestMatch.score,
+            details: `Confidence: ${Math.round(bestMatch.score)}%`,
+          });
+        }
+      } catch (e) {
+        // Ignore search failures, just means no issues found
+      }
+    })
+  );
+
+  return issues;
 };
 
-// --- 3. AUTO-DETECT NICHE HELPER ---
-const detectVideoNiche = async (videoId) => {
+// --- LAYER 2: PACING AGENT (Transcription) ---
+// Calculates WPM and checks for dead air
+const analyzePacing = async (indexId, videoId, duration) => {
   try {
-    // ✅ FIX: Switched from client.generate.text to client.analyze
-    const result = await client.analyze({
-      videoId: videoId,
-      prompt: `
-            Analyze this video and categorize it into exactly one of these niches:
-            'Real Estate', 'Fitness', 'Tech', 'Beauty', 'Business', 'Pets'.
-            
-            If it is clearly one of these, return ONLY the category name.
-            If it does not fit these but has a clear theme, return that theme name (e.g. 'Cooking', 'Gaming').
-            If it is unclear, return 'General'.
-            `,
-      temperature: 0.1,
-    });
+    console.log("   🗣 Analyzing Pacing...");
+    // Fetch transcription
+    const transcript = await client.index.video.transcription(indexId, videoId);
 
-    // Ensure we handle result.data correctly depending on SDK version
-    const detected = (result.data || result.content || "").trim();
-    console.log(`🤖 AI Auto-Detected Niche: ${detected}`);
-    return detected;
+    // Safety check if transcript is empty
+    if (!transcript || !transcript.data || transcript.data.length === 0) {
+      return { wpm: 0, deadAirCount: 0, hasAudio: false };
+    }
+
+    const words = transcript.data.reduce(
+      (acc, curr) => acc + curr.value.split(" ").length,
+      0
+    );
+    const durationMins = duration / 60;
+    const wpm = durationMins > 0 ? Math.round(words / durationMins) : 0;
+
+    // Detect dead air (gaps between segments > 2 seconds)
+    let deadAirCount = 0;
+    for (let i = 0; i < transcript.data.length - 1; i++) {
+      const endCurrent = transcript.data[i].end;
+      const startNext = transcript.data[i + 1].start;
+      if (startNext - endCurrent > 2.5) {
+        deadAirCount++;
+      }
+    }
+
+    return { wpm, deadAirCount, hasAudio: true };
   } catch (e) {
-    console.log("Auto-detect failed, defaulting to General. Error:", e.message);
-    return "General";
+    console.log("Pacing analysis failed (likely no audio)", e.message);
+    return { wpm: 0, deadAirCount: 0, hasAudio: false };
   }
 };
 
-// --- 4. THE PROMPT ---
-const GENERATE_PREMIUM_PROMPT = (audience, platform, nicheInstructions) => `
-You are a top-tier Viral Video Consultant for ${platform} specializing in the "${audience}" niche.
-Your goal is to critique this video specifically against the standards of top performers in ${audience}.
+// --- LAYER 3: CREATIVE DIRECTOR (Prompt Engineering) ---
+const GENERATE_MASTER_PROMPT = (
+  audience,
+  platform,
+  forensics,
+  pacing,
+  gist
+) => {
+  // Convert forensic data into a narrative for the AI
+  const forensicSummary =
+    forensics.length > 0
+      ? `CRITICAL TECHNICAL FLAWS DETECTED BY COMPUTER VISION: ${JSON.stringify(
+          forensics
+        )}. You MUST reference these specific timestamps as reasons for lower scores.`
+      : "Computer vision detected no major technical flaws (lighting and camera work are stable).";
 
-*** NICHE SPECIFIC STANDARDS FOR ${audience.toUpperCase()} ***
-${nicheInstructions}
-************************************************************
+  const pacingSummary = pacing.hasAudio
+    ? `PACING DATA: Speaker is at ${pacing.wpm} WPM. There are ${pacing.deadAirCount} instances of "dead air" (silence > 2.5s).`
+    : `PACING DATA: No speech detected.`;
 
-Step 1: Analyze the "Hook" (0:00 to 0:03) based on the Niche Standards above.
-- Does it match the niche expectation? (e.g., Luxury Real Estate needs elegance, Fitness needs energy).
-- Is the text/visual clear?
+  const topicSummary = `DETECTED TOPICS: ${
+    gist.topics ? gist.topics.join(", ") : "General"
+  }`;
 
-Step 2: Analyze Technical Execution.
-- Lighting, Composition, and Audio Quality compared to top ${audience} creators.
+  return `
+      You are a harsh, high-ticket viral consultant for ${platform}. 
+      
+      CONTEXTUAL DATA (FACTS):
+      - Target Audience: ${audience}
+      - ${topicSummary}
+      - ${forensicSummary}
+      - ${pacingSummary}
+      
+      YOUR TASK:
+      Analyze the video for "Retention", "Hook", and "Value".
+      
+      1. HOOK (0:00-0:03): Be ruthless. Does it grab attention?
+      2. RETENTION: Use the Technical Data provided. If there are flaws (shaky/dark), cite them as reasons people scroll away.
+      3. SCRIPT: Use the WPM data. < 120 is too slow for TikTok/Shorts. > 160 is energetic.
+      
+      OUTPUT JSON format exactly (no markdown):
+      {
+        "overallScore": (0-100),
+        "hookScore": (0-10),
+        "visualScore": (0-10),
+        "audioScore": (0-10),
+        "audienceMatchScore": (0-10),
+        "predictedRetention": [100, 80, 60... array of 6 ints ending at video end],
+        "hookAnalysis": {
+          "status": "Weak" | "Strong",
+          "timestamp": "0:00-0:03",
+          "feedback": "Specific advice."
+        },
+        "criticalIssues": ["List 3 specific things to fix. If forensics found issues, list them here with timestamps"],
+        "actionableFixes": ["3 steps to improve"],
+        "captionSuggestion": "A viral caption",
+        "viralPotential": "High/Med/Low"
+      }
+    `;
+};
 
-Step 3: Provide Analytics.
-Generate a strict JSON response.
-Rules:
-- "hookAnalysis": Be specific to the niche. (e.g., "For a Real Estate video, this pan was too fast/shaky").
-- "virality": Compare it to viral hits in this specific category.
-
-Output format (Raw JSON only):
-{
-  "overallScore": (integer 0-100),
-  "hookScore": (integer 0-10),
-  "visualScore": (integer 0-10),
-  "audioScore": (integer 0-10),
-  "audienceMatchScore": (integer 0-10),
-  "predictedRetention": [100, 85, 70, 60, 50, 40],
-  "hookAnalysis": {
-    "status": "Weak" | "Strong",
-    "timestamp": "0:00-0:03",
-    "feedback": "Critique based on niche standards."
-  },
-  "criticalIssues": [
-    "Issue 1",
-    "Issue 2"
-  ],
-  "actionableFixes": [
-    "Fix 1",
-    "Fix 2"
-  ],
-  "captionSuggestion": "Viral caption relevant to niche",
-  "viralPotential": "Low" | "Medium" | "High"
-}
-`;
-
+// --- MAIN ROUTE ---
 app.post("/analyze-video", upload.single("video"), async (req, res) => {
   if (!req.file || !GLOBAL_INDEX_ID)
     return res.status(400).json({ error: "System not ready" });
 
   const filePath = req.file.path;
-  let { audience, platform } = req.body;
+  const { audience = "General", platform = "TikTok" } = req.body;
 
   try {
-    console.log(`[1] Uploading...`);
-    const task = await client.tasks.create({
+    // 1. UPLOAD
+    console.log(`[1] Uploading Video...`);
+    const task = await client.task.create({
       indexId: GLOBAL_INDEX_ID,
-      videoFile: fs.createReadStream(filePath),
+      file: fs.createReadStream(filePath),
     });
 
+    // 2. WAIT FOR INDEXING
     console.log(`[2] Processing Task: ${task.id}`);
-
-    let attempts = 0;
     let videoId = null;
-    while (attempts < 60) {
-      const status = await client.tasks.retrieve(task.id);
+    let videoDuration = 0;
+
+    // Polling mechanism
+    for (let i = 0; i < 60; i++) {
+      const status = await client.task.retrieve(task.id);
       if (status.status === "ready") {
-        videoId = status.videoId;
+        videoId = status.video_id; // Note: SDK uses video_id or videoId depending on version
+        // Fetch video metadata for duration
+        const vidData = await client.index.video.retrieve(
+          GLOBAL_INDEX_ID,
+          videoId
+        );
+        videoDuration = vidData.metadata.duration;
         break;
       }
-      if (status.status === "failed") {
-        throw new Error(
-          `Processing failed: ${status.processStatus || "Unknown error"}`
-        );
-      }
-      await new Promise((r) => setTimeout(r, 2000));
-      attempts++;
+      if (status.status === "failed") throw new Error("Indexing Failed");
+      await new Promise((r) => setTimeout(r, 1000));
     }
 
-    if (!videoId) throw new Error("Processing Timeout");
+    if (!videoId) throw new Error("Timeout waiting for video");
 
-    // --- HYBRID LOGIC ---
-    const isUserProvided =
-      audience &&
-      audience.trim() !== "" &&
-      audience.toLowerCase() !== "general" &&
-      audience.toLowerCase() !== "unknown";
+    // 3. PARALLEL ANALYSIS (The "Premium" Difference)
+    console.log("⚡ Starting Deep Analysis Layers...");
 
-    if (!isUserProvided) {
-      console.log("[3a] No audience provided. Auto-detecting...");
-      audience = await detectVideoNiche(videoId);
-    } else {
-      console.log(`[3a] User manually specified: ${audience}`);
-    }
+    const [forensicIssues, pacingData, gistData] = await Promise.all([
+      performForensicSearch(GLOBAL_INDEX_ID, videoId),
+      analyzePacing(GLOBAL_INDEX_ID, videoId, videoDuration),
+      client.gist.retrieve(videoId, ["topic", "hashtag"]),
+    ]);
 
-    const nicheInstructions = getNicheContext(audience);
+    // 4. GENERATIVE SYNTHESIS
+    console.log("🧠 Synthesizing Final Report...");
 
-    // ✅ FIX: Switched from client.generate.text to client.analyze
-    const result = await client.analyze({
-      videoId: videoId,
-      prompt: GENERATE_PREMIUM_PROMPT(audience, platform, nicheInstructions),
-      temperature: 0.2, // Low temp for JSON consistency
+    const prompt = GENERATE_MASTER_PROMPT(
+      audience,
+      platform,
+      forensicIssues,
+      pacingData,
+      gistData
+    );
+
+    const aiResult = await client.generate.text(videoId, prompt, {
+      temperature: 0.2,
     });
 
-    // Handle data structure safely
-    let rawText = result.data || result.content || "";
-
-    rawText = rawText
+    // 5. MERGE & CLEANUP
+    const cleanJson = aiResult.data
       .replace(/```json/g, "")
       .replace(/```/g, "")
       .trim();
+    let finalData;
 
-    let analysisData;
     try {
-      analysisData = JSON.parse(rawText);
+      finalData = JSON.parse(cleanJson);
     } catch (e) {
-      console.error("JSON Parse Error:", rawText);
-      throw new Error("AI generated invalid format. Please try again.");
+      console.error("JSON Parse Error", cleanJson);
+      // Fallback structure
+      finalData = {
+        overallScore: 0,
+        criticalIssues: ["AI generation error"],
+        actionableFixes: [],
+      };
     }
 
-    analysisData.detectedAudience = audience;
+    // Inject real hashtags and detected audience
+    finalData.hashtags = gistData.hashtags || [];
+    finalData.detectedAudience = audience;
 
-    try {
-      const gistResult = await client.gist({
-        videoId: videoId,
-        types: ["hashtag", "topic"],
-      });
-      analysisData.hashtags = gistResult.hashtags || [];
-      analysisData.topics = gistResult.topics || [];
-    } catch (err) {
-      console.log("Gist generation skipped:", err.message);
-      analysisData.hashtags = [];
+    // CRITICAL: Force forensic issues into the report if AI missed them
+    // This ensures the "Hard Data" is shown to the user
+    if (forensicIssues.length > 0) {
+      const forensicText = forensicIssues.map(
+        (i) => `${i.timestamp}: ${i.type} detected (${i.details})`
+      );
+      // Prepend to critical issues
+      finalData.criticalIssues = [...forensicText, ...finalData.criticalIssues];
+    }
+
+    // Add Pacing Warning if necessary
+    if (pacingData.deadAirCount > 1) {
+      finalData.criticalIssues.push(
+        `Found ${pacingData.deadAirCount} awkward pauses (Dead Air). Remove gaps > 2s.`
+      );
     }
 
     console.log("✅ Analysis Complete");
-    fs.unlink(filePath, () => {});
-    res.json(analysisData);
+    res.json(finalData);
   } catch (error) {
-    console.error("❌ Error:", error);
-    if (fs.existsSync(filePath)) fs.unlink(filePath, () => {});
-    res.status(500).json({ error: error.message || "Internal Server Error" });
+    console.error(error);
+    res.status(500).json({ error: "Analysis Failed" });
+  } finally {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
   }
 });
 
