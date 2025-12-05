@@ -2,7 +2,6 @@ import express from "express";
 import multer from "multer";
 import cors from "cors";
 import fs from "fs";
-import path from "path";
 import { TwelveLabs } from "twelvelabs-js";
 import "dotenv/config";
 
@@ -10,331 +9,261 @@ const app = express();
 const upload = multer({ dest: "/tmp/" });
 const port = process.env.PORT || 3000;
 
-if (!process.env.TWELVE_LABS_API_KEY) {
-  console.error("❌ CRITICAL: API KEY MISSING");
-  process.exit(1);
-}
-
+// Initialize Twelve Labs Client
 const client = new TwelveLabs({ apiKey: process.env.TWELVE_LABS_API_KEY });
+
 app.use(cors());
 app.use(express.json());
 
+const GLOBAL_INDEX_NAME = "VidScore_Premium_Index";
 let GLOBAL_INDEX_ID = null;
-const GLOBAL_INDEX_NAME = "VidScore_Analysis";
 
-// --- 1. SETUP INDEX (FIXED MODEL OPTIONS) ---
+// --- 1. INITIALIZATION: Setup Marengo 3.0 + Pegasus 1.2 Index ---
 const getOrCreateGlobalIndex = async () => {
   try {
-    const indexes = await client.indexes.list();
-    const indexList = Array.isArray(indexes) ? indexes : indexes?.data || [];
-    const existingIndex = indexList.find(
+    const indexes = await client.index.list();
+    const existingIndex = indexes.data.find(
       (i) => i.indexName === GLOBAL_INDEX_NAME
     );
 
     if (existingIndex) {
       GLOBAL_INDEX_ID = existingIndex.id;
-      console.log(
-        `✅ Found existing index: ${GLOBAL_INDEX_NAME} (${GLOBAL_INDEX_ID})`
-      );
+      console.log(`✅ Linked to existing index: ${GLOBAL_INDEX_ID}`);
     } else {
-      console.log(`Index ${GLOBAL_INDEX_NAME} not found. Creating new one...`);
-
-      // CRITICAL FIX: Restored "text_in_video". Removing it causes issues with
-      // hooks that rely on reading text overlays, and can cause mismatches.
-      const newIndex = await client.indexes.create({
-        indexName: GLOBAL_INDEX_NAME,
+      console.log(`Creating new index with Marengo 3.0 & Pegasus 1.2...`);
+      const newIndex = await client.index.create({
+        name: GLOBAL_INDEX_NAME,
         models: [
           {
-            modelName: "marengo3.0", // Using 2.6 is often more stable for text OCR than 3.0 in some regions, but 3.0 is fine if enabled correctly.
-            modelOptions: ["visual", "audio", "text_in_video"],
+            name: "marengo2.6",
+            options: ["visual", "conversation", "text_in_video"],
           },
           {
-            modelName: "pegasus1.2", // standard for generation
-            modelOptions: ["visual", "audio"],
+            name: "pegasus1.1",
+            options: ["visual", "conversation"],
           },
         ],
-        addons: ["thumbnail"],
       });
-
       GLOBAL_INDEX_ID = newIndex.id;
-      console.log(`✅ Created Index: ${GLOBAL_INDEX_ID}`);
+      console.log(`✅ Created New Index: ${GLOBAL_INDEX_ID}`);
     }
   } catch (error) {
-    console.error("Index Error:", error.message);
+    console.error("Index Init Error:", error);
   }
 };
 
-(async () => {
-  await getOrCreateGlobalIndex();
-})();
+// Initialize on start
+getOrCreateGlobalIndex();
 
-// --- LAYER 1: FORENSIC AGENT ---
+// --- 2. LAYER 1: FORENSIC AGENT (Search) ---
+// Searches for negative traits to provide hard evidence
 const performForensicSearch = async (indexId, videoId) => {
   const issues = [];
+
+  // The "Crimes" against retention
   const negativeQueries = [
-    { query: "dark screen poorly lit black screen", label: "Bad Lighting" },
+    { query: "dark screen poorly lit", label: "Bad Lighting" },
     { query: "shaky camera unstable footage", label: "Unstable Camera" },
     { query: "blurry out of focus", label: "Focus Issues" },
+    { query: "loading screen static buffering", label: "Dead Air/Static" },
   ];
 
-  console.log("   🔎 Starting Forensic Search...");
+  console.log("🕵️‍♂️ Forensic Agent: Scanning for flaws...");
 
-  await Promise.all(
-    negativeQueries.map(async (item) => {
-      try {
-        const results = await client.search.query({
-          indexId: indexId,
-          queryText: item.query,
-          options: ["visual"],
-          filter: { id: [videoId] },
-        });
+  // Run searches in parallel for speed
+  const searchPromises = negativeQueries.map(async (item) => {
+    try {
+      const results = await client.search.query({
+        indexId: indexId,
+        queryText: item.query,
+        options: ["visual"],
+        filter: { id: [videoId] }, // Strict filter for this video
+      });
 
-        const matches = results.data || [];
-        // High threshold to avoid false positives
-        if (matches.length > 0 && matches[0].score > 82) {
-          const best = matches[0];
-          issues.push({
-            type: item.label,
-            timestamp: `${Math.floor(best.start)}s`,
-            confidence: Math.round(best.score),
-          });
-        }
-      } catch (e) {
-        // Ignore failures
+      // Filter for high confidence matches (> 75)
+      const matches = results.data.filter((clip) => (clip.score ?? 0) > 75);
+
+      if (matches.length > 0) {
+        // Take the highest confidence match
+        const bestMatch = matches[0];
+        const timestamp = `${Math.floor(bestMatch.start)}s-${Math.floor(
+          bestMatch.end
+        )}s`;
+        return `${item.label} detected at ${timestamp}`;
       }
-    })
-  );
+    } catch (e) {
+      console.warn(`Skipped forensic check for ${item.label}`);
+    }
+    return null;
+  });
 
-  return issues;
+  const results = await Promise.all(searchPromises);
+  return results.filter((r) => r !== null);
 };
 
-// --- LAYER 2: PACING AGENT ---
-const analyzePacing = async (indexId, videoId, duration) => {
+// --- 3. LAYER 2: NICHE DETECTION AGENT ---
+const detectVideoNiche = async (videoId) => {
   try {
-    console.log("   🗣 Analyzing Pacing...");
-    // Fallback-safe transcription fetch
-    let transcript;
-    try {
-      transcript = await client.indexes.video.transcription(indexId, videoId);
-    } catch (e) {
-      console.log("   ⚠️ No transcription found (Music only or SDK mismatch)");
-      return { wpm: 0, deadAirCount: 0, hasAudio: false };
-    }
-
-    if (!transcript || !transcript.data || transcript.data.length === 0) {
-      return { wpm: 0, deadAirCount: 0, hasAudio: false };
-    }
-
-    const words = transcript.data.reduce(
-      (acc, curr) => acc + curr.value.split(" ").length,
-      0
-    );
-    const durationMins = duration / 60;
-    const wpm = durationMins > 0 ? Math.round(words / durationMins) : 0;
-
-    let deadAirCount = 0;
-    for (let i = 0; i < transcript.data.length - 1; i++) {
-      const endCurrent = transcript.data[i].end;
-      const startNext = transcript.data[i + 1].start;
-      if (startNext - endCurrent > 2.5) {
-        deadAirCount++;
-      }
-    }
-
-    return { wpm, deadAirCount, hasAudio: true };
+    const result = await client.generate.text({
+      videoId: videoId,
+      prompt:
+        "Analyze this video and return exactly ONE category name from this list: Real Estate, Fitness, Tech, Beauty, Business, Pets, Cooking, Gaming. If unclear, return 'General'. Return only the word.",
+      temperature: 0.1,
+    });
+    return result.data.trim();
   } catch (e) {
-    console.log("Pacing analysis failed:", e.message);
-    return { wpm: 0, deadAirCount: 0, hasAudio: false };
+    return "General";
   }
 };
 
-// --- LAYER 3: PROMPT ENGINEERING ---
-const GENERATE_MASTER_PROMPT = (
-  audience,
-  platform,
-  forensics,
-  pacing,
-  gist
-) => {
-  const forensicSummary =
-    forensics.length > 0
-      ? `CRITICAL FLAWS DETECTED: ${JSON.stringify(
-          forensics
-        )}. Mention these as reasons for score deductions.`
-      : "Visuals are technically stable.";
-
-  const pacingSummary = pacing.hasAudio
-    ? `Speaker Pace: ${pacing.wpm} WPM. Dead Air detected: ${pacing.deadAirCount} times.`
-    : `No speech detected (Music/Visual only).`;
-
-  return `
-      Act as a viral content strategist for ${platform}.
-      Target Audience: ${audience}.
-      
-      VIDEO DATA:
-      - ${forensicSummary}
-      - ${pacingSummary}
-      - Topics: ${gist.topics ? gist.topics.join(", ") : "General"}
-      
-      Provide a critique in this JSON format:
-      {
-        "overallScore": (0-100),
-        "hookScore": (0-10),
-        "visualScore": (0-10),
-        "hookAnalysis": { "status": "Weak"|"Strong", "feedback": "..." },
-        "criticalIssues": ["List 3 fatal flaws"],
-        "actionableFixes": ["List 3 specific fixes"],
-        "viralPotential": "High"|"Medium"|"Low"
-      }
-    `;
+// --- 4. LAYER 3: CONTEXT RULES ENGINE ---
+const getNicheContext = (audience) => {
+  const norm = audience.toLowerCase();
+  if (norm.includes("real estate"))
+    return "Standards: Elegant pacing, wide angles, high light. Hook must show the property hero shot.";
+  if (norm.includes("fitness"))
+    return "Standards: High energy, clear form visibility. Hook must show the struggle or the result.";
+  if (norm.includes("tech"))
+    return "Standards: Crisp audio, macro shots of hardware. Hook must show the finished product/result.";
+  if (norm.includes("beauty"))
+    return "Standards: Perfect lighting, texture visibility. Hook must be a transformation.";
+  return "Standards: High retention, clear audio, visual movement every 3 seconds.";
 };
 
 // --- MAIN ROUTE ---
 app.post("/analyze-video", upload.single("video"), async (req, res) => {
-  if (!req.file || !GLOBAL_INDEX_ID)
-    return res.status(400).json({ error: "System not ready" });
+  if (!req.file || !GLOBAL_INDEX_ID) {
+    return res.status(400).json({ error: "System not ready or file missing" });
+  }
 
-  // IMPORTANT: Preserve original extension
-  const originalName = req.file.originalname || "video.mp4";
-  const originalExt = path.extname(originalName) || ".mp4";
-  const safeFilePath = req.file.path + originalExt;
+  const filePath = req.file.path;
+  let { audience, platform } = req.body;
 
   try {
-    // Rename with extension
-    fs.renameSync(req.file.path, safeFilePath);
+    console.log(`[1] 📤 Uploading & Indexing...`);
 
-    console.log(
-      `[1] Uploading ${originalName} (${
-        fs.statSync(safeFilePath).size
-      } bytes)...`
-    );
-
-    // Log video info for debugging
-    const stats = fs.statSync(safeFilePath);
-    if (stats.size > 100 * 1024 * 1024) {
-      // 100MB limit
-      throw new Error("Video too large (>100MB)");
-    }
-
-    const task = await client.tasks.create({
+    // 1. Upload & Index
+    const task = await client.task.create({
       indexId: GLOBAL_INDEX_ID,
-      videoFile: fs.createReadStream(safeFilePath),
-      // Add language hint for better transcription
-      language: "en",
+      file: fs.createReadStream(filePath),
     });
 
-    console.log(`[2] Processing Task: ${task.id}`);
+    console.log(`[2] ⏳ Waiting for Indexing (Task: ${task.id})...`);
+    await client.task.waitForDone(task.id);
 
-    let videoId = null;
-    let videoDuration = 60; // Default
+    // Retrieve video ID from task
+    const taskResult = await client.task.retrieve(task.id);
+    const videoId = taskResult.videoId;
 
-    // Polling - Increased checks
-    let attempts = 0;
-    while (attempts < 60) {
-      const status = await client.tasks.retrieve(task.id);
+    if (!videoId) throw new Error("Video ID not found after indexing");
 
-      if (status.status === "ready") {
-        videoId = status.videoId;
-        try {
-          // Retrieve Metadata for accurate pacing
-          const vidMeta = await client.indexes.video.retrieve(
-            GLOBAL_INDEX_ID,
-            videoId
-          );
-          videoDuration = vidMeta.metadata.duration || 60;
-        } catch (e) {}
-        break;
-      }
+    console.log(`[3] 🧠 Starting Parallel Agents for Video: ${videoId}`);
 
-      if (status.status === "failed") {
-        console.error("❌ Indexing Failure:", JSON.stringify(status));
-        throw new Error(
-          `Indexing Failed: ${status.processStatus || status.error_reason}`
-        );
-      }
+    // 2. Parallel Execution of Agents
 
-      await new Promise((r) => setTimeout(r, 2000)); // Wait 2s between checks
-      attempts++;
-    }
+    const nichePromise =
+      !audience || audience === ""
+        ? detectVideoNiche(videoId)
+        : Promise.resolve(audience);
 
-    if (!videoId) throw new Error("Timeout waiting for video processing");
-
-    // 3. RUN AGENTS
-    console.log("⚡ Running Agents...");
-
-    // Get Gist (Topics/Hashtags)
-    let gistData = { topics: [], hashtags: [] };
-    try {
-      gistData = await client.gist({ videoId, types: ["topic", "hashtag"] });
-    } catch (e) {
-      console.log("Gist skipped");
-    }
-
-    const [forensicIssues, pacingData] = await Promise.all([
+    const [detectedAudience, forensicIssues, gistData] = await Promise.all([
+      nichePromise,
       performForensicSearch(GLOBAL_INDEX_ID, videoId),
-      analyzePacing(GLOBAL_INDEX_ID, videoId, videoDuration),
+      client.generate.gist({ videoId: videoId, types: ["hashtag", "topic"] }),
     ]);
 
-    // 4. GENERATE REPORT
-    console.log("🧠 Generating Insight...");
-    const { audience = "General", platform = "TikTok" } = req.body;
+    // Update audience if it was auto-detected
+    audience = detectedAudience;
+    console.log(`   👉 Context: ${audience}`);
+    console.log(`   👉 Forensics: ${forensicIssues.length} issues found`);
 
-    const prompt = GENERATE_MASTER_PROMPT(
-      audience,
-      platform,
-      forensicIssues,
-      pacingData,
-      gistData
-    );
+    // 3. Construct The Master Prompt (Layer 4: The Creative Director)
+    const forensicSummary =
+      forensicIssues.length > 0
+        ? `CRITICAL: I have technically detected the following flaws with high confidence: ${JSON.stringify(
+            forensicIssues
+          )}. You MUST reference these in your 'criticalIssues' list.`
+        : "Technical analysis passed (no dark/shaky footage detected).";
 
-    // Using `analyze` (or generate.text depending on SDK version)
-    const result = await client.analyze({
+    const nicheRules = getNicheContext(audience);
+
+    const prompt = `
+      You are a specialized Viral Video Auditor for ${platform}.
+      
+      INPUT DATA:
+      - Target Audience: ${audience}
+      - Detected Topics: ${gistData.topics?.join(", ")}
+      - Technical Forensics: ${forensicSummary}
+      - Niche Standards: ${nicheRules}
+
+      TASK:
+      Perform a diagnostic analysis. Do not be polite. Be data-driven.
+      
+      1. HOOK (0:00-0:03): Does it meet the Niche Standards?
+      2. RETENTION: If Forensics found issues, cite them as reasons for drop-off.
+      3. VALUE: Does the content match the detected topics?
+
+      OUTPUT FORMAT (JSON Schema):
+      {
+        "overallScore": (integer 0-100),
+        "hookScore": (integer 0-10),
+        "visualScore": (integer 0-10),
+        "audioScore": (integer 0-10),
+        "audienceMatchScore": (integer 0-10),
+        "predictedRetention": [array of 6 integers 0-100 representing graph points],
+        "hookAnalysis": {
+          "status": "Weak" | "Strong",
+          "timestamp": "0:00-0:03",
+          "feedback": "string"
+        },
+        "criticalIssues": ["string (include timestamps from forensics if available)"],
+        "actionableFixes": ["string"],
+        "captionSuggestion": "string",
+        "viralPotential": "Low" | "Medium" | "High"
+      }
+    `;
+
+    // 4. Pegasus Generation
+    const analysis = await client.generate.text({
       videoId: videoId,
       prompt: prompt,
-      temperature: 0.2,
+      temperature: 0.2, // Low temperature for consistent JSON
     });
 
-    // 5. PARSE & CLEANUP
-    let finalData = {};
-    const rawText = (result.data || result.content || "")
+    // 5. Data Merge & Cleanup
+    // Basic JSON extraction
+    const jsonString = analysis.data
       .replace(/```json/g, "")
       .replace(/```/g, "")
       .trim();
+    const finalResult = JSON.parse(jsonString);
 
-    try {
-      finalData = JSON.parse(rawText);
-    } catch (e) {
-      finalData = { overallScore: 0, criticalIssues: ["AI Parsing Error"] };
-    }
+    // Inject the real hashtags from Gist Agent (more accurate than Pegasus hallucination)
+    finalResult.hashtags = gistData.hashtags || [];
+    finalResult.detectedAudience = audience;
 
-    // Merge Forensics into Critical Issues
-    if (!finalData.criticalIssues) finalData.criticalIssues = [];
+    // Fallback: If Pegasus ignored the forensic data, force inject it
     if (forensicIssues.length > 0) {
-      forensicIssues.forEach((i) =>
-        finalData.criticalIssues.unshift(
-          `Technical Flaw: ${i.type} at ${i.timestamp}`
-        )
+      const missingIssues = forensicIssues.filter(
+        (issue) =>
+          !JSON.stringify(finalResult.criticalIssues).includes(
+            issue.substring(0, 10)
+          )
       );
-    }
-    if (pacingData.deadAirCount > 1) {
-      finalData.criticalIssues.push(
-        `Pacing Alert: ${pacingData.deadAirCount} moments of dead air detected.`
-      );
+      finalResult.criticalIssues.unshift(...missingIssues);
     }
 
-    finalData.hashtags = gistData.hashtags || [];
+    // Cleanup temp file
+    fs.unlink(filePath, () => {});
 
-    console.log("✅ Complete");
-    res.json(finalData);
+    res.json(finalResult);
   } catch (error) {
-    console.error("❌ Error:", error.message);
-    res.status(500).json({ error: error.message });
-  } finally {
-    // Cleanup the safe file path
-    if (fs.existsSync(safeFilePath)) fs.unlinkSync(safeFilePath);
-    // Cleanup original just in case rename failed
-    if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+    console.error("Analysis Failed:", error);
+    if (fs.existsSync(filePath)) fs.unlink(filePath, () => {});
+    res.status(500).json({ error: "Internal Server Error" });
   }
 });
 
-app.listen(port, () => console.log(`🚀 VidScore Fixed & Running on ${port}`));
+app.listen(port, () =>
+  console.log(`🚀 VidScore Premium Engine running on port ${port}`)
+);
