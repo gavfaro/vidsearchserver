@@ -20,7 +20,7 @@ if (!process.env.TWELVE_LABS_API_KEY || !process.env.GEMINI_API_KEY) {
 const tlClient = new TwelveLabs({ apiKey: process.env.TWELVE_LABS_API_KEY });
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const geminiModel = genAI.getGenerativeModel({
-  model: "gemini-1.5-flash",
+  model: "gemini-2.5-flash",
   generationConfig: { responseMimeType: "application/json" },
 });
 
