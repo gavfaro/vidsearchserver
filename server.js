@@ -19,7 +19,7 @@ app.use(cors());
 app.use(express.json());
 
 let GLOBAL_INDEX_ID = null;
-const GLOBAL_INDEX_NAME = "VidScore_Premium_Analysis";
+const GLOBAL_INDEX_NAME = "VidScore_Server";
 
 // --- 1. SETUP INDEX ---
 const getOrCreateGlobalIndex = async () => {
