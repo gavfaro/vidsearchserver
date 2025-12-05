@@ -103,17 +103,6 @@ const getOrCreateGlobalIndex = async () => {
   }
 })();
 
-// --- PROMPTS ---
-
-const getHashtagPrompt = () => {
-  return `
-    Generate 7 to 10 viral, relevant hashtags for this video. 
-    Focus strictly on the actions, the emotions, the objects, and the funny moments. 
-    DO NOT generate hashtags about the video quality. 
-    Return ONLY the hashtags separated by spaces (e.g. #rain #funny #lol).
-  `;
-};
-
 // --- ROUTES ---
 
 app.post("/generate-post", upload.single("video"), async (req, res) => {
@@ -179,17 +168,17 @@ app.post("/generate-post", upload.single("video"), async (req, res) => {
     const videoId = taskStatus.videoId || taskStatus.video_id;
     console.log(`[3/3] Video Indexed: ${videoId}. Generating Content...`);
 
-    // --- Generate Caption and Hashtags in parallel ---
-    const captionPromise = client.generate.text({
+    // --- Generate Caption using analyze (open-ended analysis) ---
+    const captionPromise = client.analyze({
       videoId: videoId,
       prompt: userPrompt,
       temperature: 0.7,
     });
 
-    const hashtagPromise = client.generate.text({
+    // --- Generate Hashtags using gist ---
+    const hashtagPromise = client.gist({
       videoId: videoId,
-      prompt: getHashtagPrompt(),
-      temperature: 0.5,
+      types: ["hashtag", "topic"],
     });
 
     const [captionResult, hashtagResult] = await Promise.all([
@@ -197,20 +186,18 @@ app.post("/generate-post", upload.single("video"), async (req, res) => {
       hashtagPromise,
     ]);
 
-    const rawHashtags = hashtagResult.data || "";
+    // Extract caption from analyze response
+    const caption = captionResult.data || "";
 
-    const hashtagsArray = rawHashtags
-      .replace(/#/g, "")
-      .replace(/,/g, " ")
-      .split(/\s+/)
-      .filter((tag) => tag.length > 2)
-      .slice(0, 10);
+    // Extract hashtags from gist response
+    const hashtagsArray = hashtagResult.hashtags || [];
+    const topicsArray = hashtagResult.topics || [];
 
     const responseData = {
       platform: platform,
-      caption: captionResult.data.trim(),
+      caption: caption.trim(),
       hashtags: hashtagsArray,
-      topics: hashtagsArray,
+      topics: topicsArray,
     };
 
     console.log(
