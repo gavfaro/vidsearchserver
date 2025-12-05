@@ -19,7 +19,6 @@ app.use(cors());
 app.use(express.json());
 
 let GLOBAL_INDEX_ID = null;
-// ✅ Reverted to your original index name
 const GLOBAL_INDEX_NAME = "VidScore_Analysis";
 
 // --- 1. SETUP INDEX ---
@@ -44,7 +43,7 @@ const getOrCreateGlobalIndex = async () => {
         indexName: GLOBAL_INDEX_NAME,
         models: [
           {
-            modelName: "marengo3.0", // ✅ Will use 3.0 if creating from scratch
+            modelName: "marengo3.0",
             modelOptions: ["visual", "audio", "text_in_video"],
           },
           {
@@ -127,7 +126,7 @@ const getNicheContext = (audience) => {
       `;
   }
 
-  // 3. Fallback (Only used if Auto-Detect fails completely)
+  // 3. Fallback
   return `
       - VISUALS: Clear, bright, high definition.
       - PACING: Remove all dead air and pauses.
@@ -138,7 +137,8 @@ const getNicheContext = (audience) => {
 // --- 3. AUTO-DETECT NICHE HELPER ---
 const detectVideoNiche = async (videoId) => {
   try {
-    const result = await client.generate.text({
+    // ✅ FIX: Switched from client.generate.text to client.analyze
+    const result = await client.analyze({
       videoId: videoId,
       prompt: `
             Analyze this video and categorize it into exactly one of these niches:
@@ -150,11 +150,13 @@ const detectVideoNiche = async (videoId) => {
             `,
       temperature: 0.1,
     });
-    const detected = result.data.trim();
+
+    // Ensure we handle result.data correctly depending on SDK version
+    const detected = (result.data || result.content || "").trim();
     console.log(`🤖 AI Auto-Detected Niche: ${detected}`);
     return detected;
   } catch (e) {
-    console.log("Auto-detect failed, defaulting to General");
+    console.log("Auto-detect failed, defaulting to General. Error:", e.message);
     return "General";
   }
 };
@@ -212,7 +214,6 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
     return res.status(400).json({ error: "System not ready" });
 
   const filePath = req.file.path;
-  // Audience is now purely optional
   let { audience, platform } = req.body;
 
   try {
@@ -244,7 +245,6 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
     if (!videoId) throw new Error("Processing Timeout");
 
     // --- HYBRID LOGIC ---
-    // 1. Check if user provided input
     const isUserProvided =
       audience &&
       audience.trim() !== "" &&
@@ -252,24 +252,24 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
       audience.toLowerCase() !== "unknown";
 
     if (!isUserProvided) {
-      // 2. If NO input, we Auto-Detect
       console.log("[3a] No audience provided. Auto-detecting...");
       audience = await detectVideoNiche(videoId);
     } else {
-      // 3. If User Input exists, we use it directly
       console.log(`[3a] User manually specified: ${audience}`);
     }
 
-    // Get the rules (either hardcoded, dynamic user-based, or auto-detected)
     const nicheInstructions = getNicheContext(audience);
 
-    const result = await client.generate.text({
+    // ✅ FIX: Switched from client.generate.text to client.analyze
+    const result = await client.analyze({
       videoId: videoId,
       prompt: GENERATE_PREMIUM_PROMPT(audience, platform, nicheInstructions),
-      temperature: 0.1,
+      temperature: 0.2, // Low temp for JSON consistency
     });
 
-    let rawText = result.data;
+    // Handle data structure safely
+    let rawText = result.data || result.content || "";
+
     rawText = rawText
       .replace(/```json/g, "")
       .replace(/```/g, "")
@@ -283,7 +283,6 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
       throw new Error("AI generated invalid format. Please try again.");
     }
 
-    // Pass back the audience we actually used (whether user-typed or detected)
     analysisData.detectedAudience = audience;
 
     try {
