@@ -45,11 +45,11 @@ const getOrCreateGlobalIndex = async () => {
         indexName: GLOBAL_INDEX_NAME,
         models: [
           {
-            modelName: "marengo2.6", // Using 2.6 is often more stable for text OCR than 3.0 in some regions, but 3.0 is fine if enabled correctly.
+            modelName: "marengo3.0", // Using 2.6 is often more stable for text OCR than 3.0 in some regions, but 3.0 is fine if enabled correctly.
             modelOptions: ["visual", "audio", "text_in_video"],
           },
           {
-            modelName: "pegasus1.1", // standard for generation
+            modelName: "pegasus1.2", // standard for generation
             modelOptions: ["visual", "audio"],
           },
         ],
