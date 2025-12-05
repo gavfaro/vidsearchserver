@@ -240,8 +240,8 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
 
     // FIX: Changed client.task.create to client.tasks.create
     const task = await client.tasks.create({
-      index_id: "69327898a7016957067a32ac",
-      video_file: fs.createReadStream(filePath),
+      indexId: GLOBAL_INDEX_ID,
+      videoFile: fs.createReadStream(filePath),
     });
 
     // 2. WAIT FOR INDEXING
