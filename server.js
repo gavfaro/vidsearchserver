@@ -16,130 +16,155 @@ const client = new TwelveLabs({
 app.use(cors());
 app.use(express.json());
 
-// 1. IMPROVED: Context-aware system prompts for Captions
-const getCaptionPrompt = (platform) => {
-  switch (platform) {
-    case "Instagram":
-      return "Write an engaging, fun Instagram caption for this video. Use emojis liberally. Keep it under 100 words. Focus on the visual vibe and the fun parts.";
-    case "LinkedIn":
-      return "Write a professional LinkedIn post based on this video. Focus on the lesson learned or the activity shown. Professional tone.";
-    case "TikTok":
-      return "Write a viral TikTok caption (POV style). Keep it very short, punchy. Focus on the humor or the hook.";
-    case "Twitter":
-      return "Write a short tweet about this video. Be concise and witty.";
-    default:
-      return "Write a social media summary for this video.";
+// --- SINGLE INDEX LOGIC ---
+// We will store the Index ID here so we don't keep creating new ones.
+let GLOBAL_INDEX_ID = null;
+const GLOBAL_INDEX_NAME = "VidTag"; // Updated Index Name
+
+// Function to find existing index or create a new one ONCE
+const getOrCreateGlobalIndex = async () => {
+  try {
+    console.log(`Checking for existing index named "${GLOBAL_INDEX_NAME}"...`);
+    const indexes = await client.index.list();
+
+    // Check if our specific index already exists
+    const existingIndex = indexes.data.find(
+      (i) => i.name === GLOBAL_INDEX_NAME
+    );
+
+    if (existingIndex) {
+      console.log(
+        `Found existing index: ${existingIndex.name} (${existingIndex.id})`
+      );
+      GLOBAL_INDEX_ID = existingIndex.id;
+    } else {
+      console.log(
+        `Index "${GLOBAL_INDEX_NAME}" not found. Creating new global index...`
+      );
+      const newIndex = await client.index.create({
+        name: GLOBAL_INDEX_NAME,
+        models: [
+          {
+            modelName: "marengo2.7",
+            modelOptions: ["visual", "audio"],
+          },
+          {
+            modelName: "pegasus1.2",
+            modelOptions: ["visual", "audio"],
+          },
+        ],
+      });
+      GLOBAL_INDEX_ID = newIndex.id;
+      console.log(`Created new index: ${GLOBAL_INDEX_ID}`);
+    }
+  } catch (error) {
+    console.error("Error initializing index:", error);
   }
 };
 
-// 2. NEW: Specific Prompt for Hashtags to fix the "#PoorAudio" issue
-// We explicitly tell the AI to ignore technical quality.
+// Initialize index on server start
+getOrCreateGlobalIndex();
+
+// --- PROMPTS ---
+
 const getHashtagPrompt = () => {
   return `
     Generate 7 to 10 viral, relevant hashtags for this video. 
     Focus strictly on the actions, the emotions, the objects, and the funny moments. 
-    DO NOT generate hashtags about the video quality (e.g. ignore poor audio, ignore blur, ignore lighting). 
+    DO NOT generate hashtags about the video quality. 
     Return ONLY the hashtags separated by spaces (e.g. #rain #funny #lol).
   `;
 };
+
+// --- ROUTES ---
 
 app.post("/generate-post", upload.single("video"), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: "No video file provided" });
   }
 
+  // Ensure we have an index to upload to
+  if (!GLOBAL_INDEX_ID) {
+    await getOrCreateGlobalIndex(); // Try one more time if it failed at startup
+    if (!GLOBAL_INDEX_ID) {
+      return res
+        .status(500)
+        .json({ error: "Server failed to initialize Index" });
+    }
+  }
+
   const filePath = req.file.path;
-  const platform = req.body.platform || "Instagram";
-  const indexName = `social-gen-${Date.now()}`;
+  // We now accept the custom prompt directly from the UI
+  const userPrompt =
+    req.body.prompt || "Write a social media summary for this video.";
+  const platform = req.body.platform || "Custom";
 
   try {
-    console.log(`[1/5] Creating Index for platform: ${platform}...`);
+    console.log(`[1/3] Uploading Video to Index ${GLOBAL_INDEX_ID}...`);
 
-    // We only strictly need Marengo for indexing, but Pegasus (generative) needs to be enabled
-    const index = await client.indexes.create({
-      indexName: indexName,
-      models: [
-        {
-          modelName: "marengo2.7", // Using 2.7 or 2.6 is often faster/cheaper for indexing, adjust as needed
-          modelOptions: ["visual", "audio"],
-        },
-        {
-          modelName: "pegasus1.2", // Essential for the 'analyze' call
-          modelOptions: ["visual", "audio"],
-        },
-      ],
+    const task = await client.task.create({
+      indexId: GLOBAL_INDEX_ID,
+      file: fs.createReadStream(filePath),
     });
 
-    console.log(`[2/5] Index Created: ${index.id}. Uploading Video...`);
+    console.log(`[2/3] Indexing Task ID: ${task.id}. Waiting...`);
 
-    const task = await client.tasks.create({
-      indexId: index.id,
-      videoFile: fs.createReadStream(filePath),
-    });
-
-    console.log(`[3/5] Indexing Task ID: ${task.id}. Waiting...`);
-
-    await client.tasks.waitForDone(task.id, {
-      sleepInterval: 5,
+    await task.waitForDone({
+      sleepInterval: 2, // Check every 2 seconds
       callback: (taskUpdate) => {
         console.log(`  Status: ${taskUpdate.status}`);
       },
     });
 
     const videoId = task.videoId;
-    console.log(`[4/5] Video Indexed: ${videoId}. Generating Content...`);
+    console.log(`[3/3] Video Indexed: ${videoId}. Generating Content...`);
 
     // --- STEP 1: Generate Caption (Pegasus) ---
-    const captionPromise = client.analyze({
+    // Use the USER PROVIDED prompt
+    const captionPromise = client.generate.text({
       videoId: videoId,
-      prompt: getCaptionPrompt(platform),
+      prompt: userPrompt,
       temperature: 0.7,
     });
 
     // --- STEP 2: Generate Hashtags (Pegasus) ---
-    // REPLACED client.gist with client.analyze
-    const hashtagPromise = client.analyze({
+    const hashtagPromise = client.generate.text({
       videoId: videoId,
       prompt: getHashtagPrompt(),
-      temperature: 0.5, // Lower temp for more relevant/focused tags
+      temperature: 0.5,
     });
 
-    // Run both AI requests in parallel for speed
     const [captionResult, hashtagResult] = await Promise.all([
       captionPromise,
       hashtagPromise,
     ]);
 
-    // Parse the AI text output into an array of strings
-    // The AI usually returns "#tag1 #tag2", so we split by space
     const rawHashtags = hashtagResult.data || "";
 
-    // Cleanup: Remove existing # symbols to clean up, then split, filter empty
     const hashtagsArray = rawHashtags
-      .replace(/#/g, "") // Remove # if the AI added them
-      .replace(/,/g, " ") // Replace commas with spaces if AI added them
-      .split(/\s+/) // Split by whitespace
-      .filter((tag) => tag.length > 2) // Remove tiny artifacts
-      .slice(0, 10); // Limit to 10
+      .replace(/#/g, "")
+      .replace(/,/g, " ")
+      .split(/\s+/)
+      .filter((tag) => tag.length > 2)
+      .slice(0, 10);
 
     const responseData = {
       platform: platform,
       caption: captionResult.data.trim(),
       hashtags: hashtagsArray,
-      // We pass empty topics or copy hashtags because your Swift Struct expects this field
       topics: hashtagsArray,
     };
 
     console.log(
-      `[5/5] Success! Caption: ${responseData.caption.substring(0, 20)}...`
+      `Success! Caption: ${responseData.caption.substring(0, 20)}...`
     );
 
+    // Clean up the uploaded file
     fs.unlink(filePath, (err) => {
       if (err) console.error("Error deleting temp file:", err);
     });
 
-    // Cleanup index (Recommended for production to save costs/clutter)
-    // await client.indexes.delete(index.id);
+    // Note: We DO NOT delete the index anymore. We keep it for the next request.
 
     res.json(responseData);
   } catch (error) {
