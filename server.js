@@ -54,7 +54,7 @@ const getOrCreateGlobalIndex = async () => {
         models: [
           {
             modelName: "marengo3.0", // Or 3.0 if available to your key
-            modelOptions: ["visual", "audio", "text_in_video"],
+            modelOptions: ["visual", "audio"],
           },
         ],
         addons: ["thumbnail"],
