@@ -36,7 +36,8 @@ const getOrCreateGlobalIndex = async () => {
     // Try-catch around the list operation specifically
     let indexes;
     try {
-      indexes = await client.index.list();
+      // SDK uses 'indexes' (plural), not 'index'
+      indexes = await client.indexes.list();
     } catch (listError) {
       console.error("Error listing indexes:", listError.message);
       throw new Error(
@@ -48,38 +49,38 @@ const getOrCreateGlobalIndex = async () => {
     // API returns: { data: [...], page_info: {...} }
     const indexList = Array.isArray(indexes) ? indexes : indexes?.data || [];
 
-    // API uses 'index_name' and '_id' fields
+    // SDK uses 'indexName' and 'id' fields (camelCase, not snake_case)
     const existingIndex = indexList.find(
-      (i) => i.index_name === GLOBAL_INDEX_NAME
+      (i) => i.indexName === GLOBAL_INDEX_NAME
     );
 
     if (existingIndex) {
       console.log(
-        `✅ Found existing index: ${existingIndex.index_name} (${existingIndex._id})`
+        `✅ Found existing index: ${existingIndex.indexName} (${existingIndex.id})`
       );
-      GLOBAL_INDEX_ID = existingIndex._id;
+      GLOBAL_INDEX_ID = existingIndex.id;
     } else {
       console.log(
         `Index "${GLOBAL_INDEX_NAME}" not found. Creating new global index...`
       );
 
-      // API expects: index_name, models (with model_name and model_options)
-      const newIndex = await client.index.create({
-        index_name: GLOBAL_INDEX_NAME,
+      // SDK expects: indexName (camelCase), models with modelName and modelOptions
+      const newIndex = await client.indexes.create({
+        indexName: GLOBAL_INDEX_NAME,
         models: [
           {
-            model_name: "marengo3.0",
-            model_options: ["visual", "audio"],
+            modelName: "marengo2.7",
+            modelOptions: ["visual", "audio"],
           },
           {
-            model_name: "pegasus1.2",
-            model_options: ["visual", "audio"],
+            modelName: "pegasus1.2",
+            modelOptions: ["visual", "audio"],
           },
         ],
         addons: ["thumbnail"],
       });
 
-      GLOBAL_INDEX_ID = newIndex._id;
+      GLOBAL_INDEX_ID = newIndex.id;
       console.log(`✅ Created new index: ${GLOBAL_INDEX_ID}`);
     }
   } catch (error) {
@@ -142,9 +143,10 @@ app.post("/generate-post", upload.single("video"), async (req, res) => {
   try {
     console.log(`[1/3] Uploading Video to Index ${GLOBAL_INDEX_ID}...`);
 
-    const task = await client.task.create({
+    // SDK uses client.tasks.create (plural), not client.task.create
+    const task = await client.tasks.create({
       indexId: GLOBAL_INDEX_ID,
-      file: fs.createReadStream(filePath),
+      videoFile: fs.createReadStream(filePath),
     });
 
     console.log(`[2/3] Indexing Task ID: ${task.id}. Waiting...`);
