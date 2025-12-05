@@ -48,11 +48,11 @@ const getOrCreateGlobalIndex = async () => {
         models: [
           {
             modelName: "marengo3.0",
-            modelOptions: ["visual", "conversation", "text_in_video"],
+            modelOptions: ["visual", "audio", "text_in_video"],
           },
           {
             modelName: "pegasus1.2",
-            modelOptions: ["visual", "conversation"],
+            modelOptions: ["visual", "audio"],
           },
         ],
         addons: ["thumbnail"],
