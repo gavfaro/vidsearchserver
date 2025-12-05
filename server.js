@@ -60,7 +60,7 @@ const getOrCreateGlobalIndex = async () => {
           modelOptions: ["visual", "audio"], // multimodal perception
         },
       ],
-      addons: ["thumbnail", "transcription"], // add transcription for dialogue clarity
+      addons: ["thumbnail"], // add transcription for dialogue clarity
     });
 
     GLOBAL_INDEX_ID = created.id;
