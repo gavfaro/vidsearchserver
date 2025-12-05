@@ -48,7 +48,7 @@ const getOrCreateGlobalIndex = async () => {
         models: [
           {
             modelName: "marengo3.0",
-            modelOptions: ["visual", "audio", "text_in_video"],
+            modelOptions: ["visual", "audio"], // ✅ FIXED
           },
           {
             modelName: "pegasus1.2",
@@ -57,6 +57,7 @@ const getOrCreateGlobalIndex = async () => {
         ],
         addons: ["thumbnail"],
       });
+
       GLOBAL_INDEX_ID = newIndex.id;
       console.log(`✅ Created Index: ${GLOBAL_INDEX_ID}`);
     }
