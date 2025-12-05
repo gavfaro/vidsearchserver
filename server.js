@@ -28,13 +28,11 @@ const initIndex = async () => {
     console.log(`✅ Index Ready: ${GLOBAL_INDEX_ID}`);
   } else {
     const newIndex = await client.indexes.create({
-      indexName: INDEX_NAME, // ✅ FIXED: Changed 'name' to 'indexName'
+      indexName: INDEX_NAME,
       models: [
-        {
-          modelName: "marengo2.7",
-          modelOptions: ["visual", "conversation", "text_in_video"],
-        },
-        { modelName: "pegasus1.2", modelOptions: ["visual", "conversation"] },
+        // ✅ FIXED: modelOptions must only contain 'visual' and 'audio'
+        { modelName: "marengo2.7", modelOptions: ["visual", "audio"] },
+        { modelName: "pegasus1.2", modelOptions: ["visual", "audio"] },
       ],
     });
     GLOBAL_INDEX_ID = newIndex.id;
