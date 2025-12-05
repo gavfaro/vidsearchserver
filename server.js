@@ -25,14 +25,14 @@ const initIndex = async () => {
     GLOBAL_INDEX_ID = existing.id;
     console.log(`✅ Index Ready: ${GLOBAL_INDEX_ID}`);
   } else {
-    const newIndex = await client.index.create({
+    const newIndex = await client.indexes.create({
       name: INDEX_NAME,
       models: [
         {
-          modelName: "marengo3.0",
-          modelOptions: ["visual", "audio", "text_in_video"],
+          modelName: "marengo2.7",
+          modelOptions: ["visual", "conversation", "text_in_video"],
         },
-        { modelName: "pegasus1.2", modelOptions: ["visual", "audio"] },
+        { modelName: "pegasus1.2", modelOptions: ["visual", "conversation"] },
       ],
     });
     GLOBAL_INDEX_ID = newIndex.id;
@@ -82,13 +82,13 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
 
   try {
     // 1. Upload & Index
-    const task = await client.task.create({
+    const task = await client.tasks.create({
       indexId: GLOBAL_INDEX_ID,
-      file: fs.createReadStream(filePath),
+      videoFile: fs.createReadStream(filePath),
     });
 
     // Poll for completion
-    await task.waitForDone({ sleepInterval: 2000 });
+    await client.tasks.waitForDone(task.id, { sleepInterval: 2000 });
     const videoId = task.videoId;
 
     // 2. MARENGO INTELLIGENCE GATHERING (The Premium Step)
@@ -123,7 +123,7 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
     });
 
     // 4. HASHTAGS (Gist)
-    const gist = await client.generate.gist({
+    const gist = await client.gist({
       videoId: videoId,
       types: ["hashtag"],
     });
