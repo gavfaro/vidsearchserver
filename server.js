@@ -19,7 +19,7 @@ app.use(cors());
 app.use(express.json());
 
 let GLOBAL_INDEX_ID = null;
-const GLOBAL_INDEX_NAME = "VidScore_Analysis_Premium";
+const GLOBAL_INDEX_NAME = "VidScore_Analysis";
 
 // --- 1. SETUP INDEX ---
 const getOrCreateGlobalIndex = async () => {
@@ -240,8 +240,8 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
 
     // FIX: Changed client.task.create to client.tasks.create
     const task = await client.tasks.create({
-      indexId: GLOBAL_INDEX_ID,
-      file: fs.createReadStream(filePath),
+      index_id: GLOBAL_INDEX_ID,
+      video_file: fs.createReadStream(filePath),
     });
 
     // 2. WAIT FOR INDEXING
