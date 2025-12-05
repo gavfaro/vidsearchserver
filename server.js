@@ -18,7 +18,7 @@ let GLOBAL_INDEX_ID = null;
 
 // 1. Ensure Index uses Marengo 3.0 (Critical for Search) and Pegasus 1.2
 const initIndex = async () => {
-  const indexes = await client.index.list();
+  const indexes = await client.indexes.list();
   const existing = indexes.data.find((i) => i.indexName === INDEX_NAME);
 
   if (existing) {
