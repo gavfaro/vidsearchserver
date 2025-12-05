@@ -194,19 +194,33 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
   if (!req.file || !GLOBAL_INDEX_ID)
     return res.status(400).json({ error: "System not ready" });
 
-  // 1. FILE RENAMING FIX
-  // Multer saves as "554a..." with no extension. TwelveLabs needs ".mp4" to process correctly.
-  const originalExt = path.extname(req.file.originalname) || ".mp4";
+  // IMPORTANT: Preserve original extension
+  const originalName = req.file.originalname || "video.mp4";
+  const originalExt = path.extname(originalName) || ".mp4";
   const safeFilePath = req.file.path + originalExt;
 
   try {
+    // Rename with extension
     fs.renameSync(req.file.path, safeFilePath);
 
-    console.log(`[1] Uploading ${safeFilePath}...`);
+    console.log(
+      `[1] Uploading ${originalName} (${
+        fs.statSync(safeFilePath).size
+      } bytes)...`
+    );
+
+    // Log video info for debugging
+    const stats = fs.statSync(safeFilePath);
+    if (stats.size > 100 * 1024 * 1024) {
+      // 100MB limit
+      throw new Error("Video too large (>100MB)");
+    }
 
     const task = await client.tasks.create({
       indexId: GLOBAL_INDEX_ID,
-      videoFile: fs.createReadStream(safeFilePath), // Send the file with the extension
+      videoFile: fs.createReadStream(safeFilePath),
+      // Add language hint for better transcription
+      language: "en",
     });
 
     console.log(`[2] Processing Task: ${task.id}`);
