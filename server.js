@@ -15,13 +15,14 @@ const client = new TwelveLabs({ apiKey: process.env.TWELVE_LABS_API_KEY });
 app.use(cors());
 app.use(express.json());
 
-const GLOBAL_INDEX_NAME = "VidScore_Premium_Index";
+const GLOBAL_INDEX_NAME = "VidScore_Premium_Index_V2";
 let GLOBAL_INDEX_ID = null;
 
 // --- 1. INITIALIZATION: Setup Marengo 3.0 + Pegasus 1.2 Index ---
 const getOrCreateGlobalIndex = async () => {
   try {
-    const indexes = await client.index.list();
+    // FIX: Used 'indexes' (plural) instead of 'index'
+    const indexes = await client.indexes.list();
     const existingIndex = indexes.data.find(
       (i) => i.indexName === GLOBAL_INDEX_NAME
     );
@@ -31,16 +32,17 @@ const getOrCreateGlobalIndex = async () => {
       console.log(`✅ Linked to existing index: ${GLOBAL_INDEX_ID}`);
     } else {
       console.log(`Creating new index with Marengo 3.0 & Pegasus 1.2...`);
-      const newIndex = await client.index.create({
-        name: GLOBAL_INDEX_NAME,
+      // FIX: Updated model names and options syntax
+      const newIndex = await client.indexes.create({
+        indexName: GLOBAL_INDEX_NAME,
         models: [
           {
-            name: "marengo2.6",
-            options: ["visual", "conversation", "text_in_video"],
+            modelName: "marengo3.0",
+            modelOptions: ["visual", "audio"],
           },
           {
-            name: "pegasus1.1",
-            options: ["visual", "conversation"],
+            modelName: "pegasus1.2",
+            modelOptions: ["visual", "audio"],
           },
         ],
       });
@@ -58,8 +60,6 @@ getOrCreateGlobalIndex();
 // --- 2. LAYER 1: FORENSIC AGENT (Search) ---
 // Searches for negative traits to provide hard evidence
 const performForensicSearch = async (indexId, videoId) => {
-  const issues = [];
-
   // The "Crimes" against retention
   const negativeQueries = [
     { query: "dark screen poorly lit", label: "Bad Lighting" },
@@ -73,26 +73,31 @@ const performForensicSearch = async (indexId, videoId) => {
   // Run searches in parallel for speed
   const searchPromises = negativeQueries.map(async (item) => {
     try {
-      const results = await client.search.query({
+      // FIX: Using 'client.search.query' and 'searchOptions'
+      const searchPager = await client.search.query({
         indexId: indexId,
         queryText: item.query,
-        options: ["visual"],
+        searchOptions: ["visual"],
         filter: { id: [videoId] }, // Strict filter for this video
       });
 
-      // Filter for high confidence matches (> 75)
-      const matches = results.data.filter((clip) => (clip.score ?? 0) > 75);
+      // Pagination handling - we just check the first page
+      let bestMatch = null;
+      for await (const result of searchPager) {
+        if (result.score > 75) {
+          bestMatch = result;
+          break; // Found a high confidence match
+        }
+      }
 
-      if (matches.length > 0) {
-        // Take the highest confidence match
-        const bestMatch = matches[0];
+      if (bestMatch) {
         const timestamp = `${Math.floor(bestMatch.start)}s-${Math.floor(
           bestMatch.end
         )}s`;
         return `${item.label} detected at ${timestamp}`;
       }
     } catch (e) {
-      console.warn(`Skipped forensic check for ${item.label}`);
+      console.warn(`Skipped forensic check for ${item.label}: ${e.message}`);
     }
     return null;
   });
@@ -104,14 +109,16 @@ const performForensicSearch = async (indexId, videoId) => {
 // --- 3. LAYER 2: NICHE DETECTION AGENT ---
 const detectVideoNiche = async (videoId) => {
   try {
-    const result = await client.generate.text({
+    // FIX: Using 'client.analyze' for text generation
+    const result = await client.analyze({
       videoId: videoId,
       prompt:
         "Analyze this video and return exactly ONE category name from this list: Real Estate, Fitness, Tech, Beauty, Business, Pets, Cooking, Gaming. If unclear, return 'General'. Return only the word.",
       temperature: 0.1,
     });
-    return result.data.trim();
+    return result.data ? result.data.trim() : "General";
   } catch (e) {
+    console.log("Niche detection failed, defaulting to General");
     return "General";
   }
 };
@@ -137,22 +144,26 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
   }
 
   const filePath = req.file.path;
-  let { audience, platform } = req.body;
+  // Default values if not provided
+  let audience = req.body.audience || "";
+  let platform = req.body.platform || "TikTok";
 
   try {
     console.log(`[1] 📤 Uploading & Indexing...`);
 
     // 1. Upload & Index
-    const task = await client.task.create({
+    // FIX: Using 'client.tasks.create'
+    const task = await client.tasks.create({
       indexId: GLOBAL_INDEX_ID,
-      file: fs.createReadStream(filePath),
+      videoFile: fs.createReadStream(filePath),
     });
 
     console.log(`[2] ⏳ Waiting for Indexing (Task: ${task.id})...`);
-    await client.task.waitForDone(task.id);
+    // FIX: Using 'client.tasks.waitForDone'
+    await client.tasks.waitForDone(task.id);
 
     // Retrieve video ID from task
-    const taskResult = await client.task.retrieve(task.id);
+    const taskResult = await client.tasks.retrieve(task.id);
     const videoId = taskResult.videoId;
 
     if (!videoId) throw new Error("Video ID not found after indexing");
@@ -160,7 +171,6 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
     console.log(`[3] 🧠 Starting Parallel Agents for Video: ${videoId}`);
 
     // 2. Parallel Execution of Agents
-
     const nichePromise =
       !audience || audience === ""
         ? detectVideoNiche(videoId)
@@ -169,7 +179,7 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
     const [detectedAudience, forensicIssues, gistData] = await Promise.all([
       nichePromise,
       performForensicSearch(GLOBAL_INDEX_ID, videoId),
-      client.generate.gist({ videoId: videoId, types: ["hashtag", "topic"] }),
+      client.gist({ videoId: videoId, types: ["hashtag", "topic"] }),
     ]);
 
     // Update audience if it was auto-detected
@@ -177,7 +187,7 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
     console.log(`   👉 Context: ${audience}`);
     console.log(`   👉 Forensics: ${forensicIssues.length} issues found`);
 
-    // 3. Construct The Master Prompt (Layer 4: The Creative Director)
+    // 3. Construct The Master Prompt
     const forensicSummary =
       forensicIssues.length > 0
         ? `CRITICAL: I have technically detected the following flaws with high confidence: ${JSON.stringify(
@@ -202,53 +212,73 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
       1. HOOK (0:00-0:03): Does it meet the Niche Standards?
       2. RETENTION: If Forensics found issues, cite them as reasons for drop-off.
       3. VALUE: Does the content match the detected topics?
-
-      OUTPUT FORMAT (JSON Schema):
-      {
-        "overallScore": (integer 0-100),
-        "hookScore": (integer 0-10),
-        "visualScore": (integer 0-10),
-        "audioScore": (integer 0-10),
-        "audienceMatchScore": (integer 0-10),
-        "predictedRetention": [array of 6 integers 0-100 representing graph points],
-        "hookAnalysis": {
-          "status": "Weak" | "Strong",
-          "timestamp": "0:00-0:03",
-          "feedback": "string"
-        },
-        "criticalIssues": ["string (include timestamps from forensics if available)"],
-        "actionableFixes": ["string"],
-        "captionSuggestion": "string",
-        "viralPotential": "Low" | "Medium" | "High"
-      }
     `;
 
-    // 4. Pegasus Generation
-    const analysis = await client.generate.text({
+    // 4. Pegasus Generation with JSON Schema enforcement
+    // This ensures the output strictly matches the Swift Codable struct
+    const analysis = await client.analyze({
       videoId: videoId,
       prompt: prompt,
-      temperature: 0.2, // Low temperature for consistent JSON
+      temperature: 0.2,
+      responseFormat: {
+        type: "json_schema",
+        jsonSchema: {
+          type: "object",
+          properties: {
+            overallScore: { type: "integer" },
+            hookScore: { type: "number" },
+            visualScore: { type: "number" },
+            audioScore: { type: "number" },
+            audienceMatchScore: { type: "number" },
+            predictedRetention: {
+              type: "array",
+              items: { type: "integer" },
+            },
+            hookAnalysis: {
+              type: "object",
+              properties: {
+                status: { type: "string" },
+                timestamp: { type: "string" },
+                feedback: { type: "string" },
+              },
+              required: ["status", "timestamp", "feedback"],
+            },
+            criticalIssues: {
+              type: "array",
+              items: { type: "string" },
+            },
+            actionableFixes: {
+              type: "array",
+              items: { type: "string" },
+            },
+            captionSuggestion: { type: "string" },
+            viralPotential: { type: "string" },
+          },
+          required: [
+            "overallScore",
+            "hookScore",
+            "visualScore",
+            "hookAnalysis",
+            "criticalIssues",
+            "captionSuggestion",
+            "viralPotential",
+          ],
+        },
+      },
     });
 
     // 5. Data Merge & Cleanup
-    // Basic JSON extraction
-    const jsonString = analysis.data
-      .replace(/```json/g, "")
-      .replace(/```/g, "")
-      .trim();
-    const finalResult = JSON.parse(jsonString);
+    const finalResult = JSON.parse(analysis.data);
 
-    // Inject the real hashtags from Gist Agent (more accurate than Pegasus hallucination)
+    // Inject the real hashtags from Gist Agent
     finalResult.hashtags = gistData.hashtags || [];
     finalResult.detectedAudience = audience;
 
     // Fallback: If Pegasus ignored the forensic data, force inject it
     if (forensicIssues.length > 0) {
+      const issuesString = JSON.stringify(finalResult.criticalIssues);
       const missingIssues = forensicIssues.filter(
-        (issue) =>
-          !JSON.stringify(finalResult.criticalIssues).includes(
-            issue.substring(0, 10)
-          )
+        (issue) => !issuesString.includes(issue.substring(0, 10))
       );
       finalResult.criticalIssues.unshift(...missingIssues);
     }
