@@ -19,6 +19,7 @@ app.use(cors());
 app.use(express.json());
 
 let GLOBAL_INDEX_ID = null;
+// ✅ Reverted to your original index name
 const GLOBAL_INDEX_NAME = "VidScore_Analysis";
 
 // --- 1. SETUP INDEX ---
@@ -32,17 +33,24 @@ const getOrCreateGlobalIndex = async () => {
 
     if (existingIndex) {
       GLOBAL_INDEX_ID = existingIndex.id;
-      console.log(`✅ Using Index: ${GLOBAL_INDEX_ID}`);
+      console.log(
+        `✅ Found existing index: ${GLOBAL_INDEX_NAME} (${GLOBAL_INDEX_ID})`
+      );
     } else {
-      console.log(`Creating new index...`);
+      console.log(
+        `Index ${GLOBAL_INDEX_NAME} not found. Creating new one with Marengo 3.0...`
+      );
       const newIndex = await client.indexes.create({
         indexName: GLOBAL_INDEX_NAME,
         models: [
           {
-            modelName: "marengo3.0", // ✅ Updated to Marengo 3.0
+            modelName: "marengo3.0", // ✅ Will use 3.0 if creating from scratch
+            modelOptions: ["visual", "audio", "text_in_video"],
+          },
+          {
+            modelName: "pegasus1.2",
             modelOptions: ["visual", "audio"],
           },
-          { modelName: "pegasus1.2", modelOptions: ["visual", "audio"] },
         ],
         addons: ["thumbnail"],
       });
@@ -58,44 +66,154 @@ const getOrCreateGlobalIndex = async () => {
   await getOrCreateGlobalIndex();
 })();
 
-// --- 2. THE MEGA PROMPT ---
-// This instructs the AI to return strictly formatted JSON data
-const ANALYSIS_PROMPT = (audience, platform) => `
-You are a viral video consultant for ${platform}. The target audience is: ${audience}.
-Analyze this video strictly. Do not be nice. Be accurate.
+// --- 2. NICHE RULES ENGINE (HYBRID) ---
+const getNicheContext = (audience) => {
+  const normalizedAudience = audience ? audience.toLowerCase() : "general";
 
-Return a valid JSON object (no markdown, no code blocks, just raw JSON) with this exact structure:
+  // Hardcoded rules for high-value niches
+  const rules = {
+    "real estate": `
+      - VISUALS: Look for high-quality wide angles, smooth drone shots, or bright interior lighting.
+      - PACING: Should be elegant and smooth, not frantic.
+      - HOOK: Must show the "hero shot" (front of house or best room) immediately or overlay text with price/location.
+      - AUDIO: clear voiceover or trending luxury audio.
+      - FAILURE POINTS: Dark lighting, shaky camera, clutter in rooms.
+    `,
+    fitness: `
+      - VISUALS: Needs to show physique or movement clearly.
+      - PACING: Fast, energetic, cuts on the beat of the music.
+      - HOOK: Needs to show the "result" (the six-pack) or the "struggle" (the heavy weight) in the first second.
+      - AUDIO: High energy music or ASMR gym sounds.
+      - FAILURE POINTS: Bad form, boring rest periods left in, bad camera angle.
+    `,
+    tech: `
+      - VISUALS: Clean desk setup, clear screen recordings, high contrast.
+      - PACING: Very fast, information-dense.
+      - HOOK: Show the "cool gadget" or the "final code result" immediately.
+      - AUDIO: Crisp voiceover is mandatory. 
+      - FAILURE POINTS: Blurry screens, slow typing, monotone voice.
+    `,
+    beauty: `
+      - VISUALS: Perfect lighting (ring light), close-ups of texture.
+      - PACING: Transitions (swipes, finger snaps) are critical.
+      - HOOK: Before/After result shown instantly.
+      - FAILURE POINTS: Bad color grading, messy background.
+    `,
+    business: `
+      - VISUALS: Talking head, but must have dynamic captions.
+      - PACING: No pauses. "Millennial Pause" at start is a critical failure.
+      - HOOK: A controversial statement or a specific "How to" promise.
+      - FAILURE POINTS: looking away from camera, slow start, boring background.
+    `,
+    pets: `
+      - VISUALS: Cute close-ups, funny movements.
+      - PACING: Chaos is good.
+      - HOOK: The funny action must happen immediately.
+      - FAILURE POINTS: Human talking too much, camera too far away.
+    `,
+  };
+
+  // 1. Check strict hardcoded matches
+  for (const [key, value] of Object.entries(rules)) {
+    if (normalizedAudience.includes(key)) return value;
+  }
+
+  // 2. Dynamic Handle: User typed something specific
+  if (normalizedAudience !== "general" && normalizedAudience !== "") {
+    return `
+      - CONTEXT: The user explicitly stated this video is for the "${audience}" niche.
+      - INSTRUCTION: Use your internal knowledge of ${audience} content on social media.
+      - CRITERIA: Judge the hook, pacing, and visuals based on what currently performs well for ${audience}.
+      `;
+  }
+
+  // 3. Fallback (Only used if Auto-Detect fails completely)
+  return `
+      - VISUALS: Clear, bright, high definition.
+      - PACING: Remove all dead air and pauses.
+      - HOOK: Visual movement or text overlay in first 3 seconds.
+  `;
+};
+
+// --- 3. AUTO-DETECT NICHE HELPER ---
+const detectVideoNiche = async (videoId) => {
+  try {
+    const result = await client.generate.text({
+      videoId: videoId,
+      prompt: `
+            Analyze this video and categorize it into exactly one of these niches:
+            'Real Estate', 'Fitness', 'Tech', 'Beauty', 'Business', 'Pets'.
+            
+            If it is clearly one of these, return ONLY the category name.
+            If it does not fit these but has a clear theme, return that theme name (e.g. 'Cooking', 'Gaming').
+            If it is unclear, return 'General'.
+            `,
+      temperature: 0.1,
+    });
+    const detected = result.data.trim();
+    console.log(`🤖 AI Auto-Detected Niche: ${detected}`);
+    return detected;
+  } catch (e) {
+    console.log("Auto-detect failed, defaulting to General");
+    return "General";
+  }
+};
+
+// --- 4. THE PROMPT ---
+const GENERATE_PREMIUM_PROMPT = (audience, platform, nicheInstructions) => `
+You are a top-tier Viral Video Consultant for ${platform} specializing in the "${audience}" niche.
+Your goal is to critique this video specifically against the standards of top performers in ${audience}.
+
+*** NICHE SPECIFIC STANDARDS FOR ${audience.toUpperCase()} ***
+${nicheInstructions}
+************************************************************
+
+Step 1: Analyze the "Hook" (0:00 to 0:03) based on the Niche Standards above.
+- Does it match the niche expectation? (e.g., Luxury Real Estate needs elegance, Fitness needs energy).
+- Is the text/visual clear?
+
+Step 2: Analyze Technical Execution.
+- Lighting, Composition, and Audio Quality compared to top ${audience} creators.
+
+Step 3: Provide Analytics.
+Generate a strict JSON response.
+Rules:
+- "hookAnalysis": Be specific to the niche. (e.g., "For a Real Estate video, this pan was too fast/shaky").
+- "virality": Compare it to viral hits in this specific category.
+
+Output format (Raw JSON only):
 {
-  "overallScore": (number 0-100),
-  "hookScore": (number 0-10),
-  "visualScore": (number 0-10),
-  "audioScore": (number 0-10),
-  "audienceMatchScore": (number 0-10),
-  "predictedRetention": [ (array of 6 numbers from 100 down to X representing viewer % at 0s, 5s, 10s, 15s, 20s, 25s+) ],
+  "overallScore": (integer 0-100),
+  "hookScore": (integer 0-10),
+  "visualScore": (integer 0-10),
+  "audioScore": (integer 0-10),
+  "audienceMatchScore": (integer 0-10),
+  "predictedRetention": [100, 85, 70, 60, 50, 40],
   "hookAnalysis": {
-    "status": "Weak" or "Strong",
-    "timestamp": "0:03",
-    "feedback": "string explaining the hook issue or strength"
+    "status": "Weak" | "Strong",
+    "timestamp": "0:00-0:03",
+    "feedback": "Critique based on niche standards."
   },
   "criticalIssues": [
-    "string 1 (major issue)",
-    "string 2 (major issue)"
+    "Issue 1",
+    "Issue 2"
   ],
   "actionableFixes": [
-    "string 1 (specific edit to make)",
-    "string 2 (specific edit to make)"
+    "Fix 1",
+    "Fix 2"
   ],
-  "captionSuggestion": "A viral style caption",
-  "viralPotential": "Low", "Medium", or "High"
+  "captionSuggestion": "Viral caption relevant to niche",
+  "viralPotential": "Low" | "Medium" | "High"
 }
 `;
 
 app.post("/analyze-video", upload.single("video"), async (req, res) => {
   if (!req.file || !GLOBAL_INDEX_ID)
-    return res.status(400).json({ error: "Not ready" });
+    return res.status(400).json({ error: "System not ready" });
 
   const filePath = req.file.path;
-  const { audience, platform } = req.body;
+  // Audience is now purely optional
+  let { audience, platform } = req.body;
 
   try {
     console.log(`[1] Uploading...`);
@@ -106,7 +224,6 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
 
     console.log(`[2] Processing Task: ${task.id}`);
 
-    // Polling Loop
     let attempts = 0;
     let videoId = null;
     while (attempts < 60) {
@@ -115,45 +232,80 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
         videoId = status.videoId;
         break;
       }
-      if (status.status === "failed") throw new Error("Processing failed");
+      if (status.status === "failed") {
+        throw new Error(
+          `Processing failed: ${status.processStatus || "Unknown error"}`
+        );
+      }
       await new Promise((r) => setTimeout(r, 2000));
       attempts++;
     }
 
-    if (!videoId) throw new Error("Timeout");
+    if (!videoId) throw new Error("Processing Timeout");
 
-    console.log(`[3] Analyzing Video ID: ${videoId}`);
+    // --- HYBRID LOGIC ---
+    // 1. Check if user provided input
+    const isUserProvided =
+      audience &&
+      audience.trim() !== "" &&
+      audience.toLowerCase() !== "general" &&
+      audience.toLowerCase() !== "unknown";
 
-    // ✅ FIXED: Use client.analyze() instead of client.generate.text()
-    const result = await client.analyze({
+    if (!isUserProvided) {
+      // 2. If NO input, we Auto-Detect
+      console.log("[3a] No audience provided. Auto-detecting...");
+      audience = await detectVideoNiche(videoId);
+    } else {
+      // 3. If User Input exists, we use it directly
+      console.log(`[3a] User manually specified: ${audience}`);
+    }
+
+    // Get the rules (either hardcoded, dynamic user-based, or auto-detected)
+    const nicheInstructions = getNicheContext(audience);
+
+    const result = await client.generate.text({
       videoId: videoId,
-      prompt: ANALYSIS_PROMPT(audience, platform),
-      temperature: 0.2, // Low temp for consistent JSON
+      prompt: GENERATE_PREMIUM_PROMPT(audience, platform, nicheInstructions),
+      temperature: 0.1,
     });
 
-    // Clean the output to ensure it's valid JSON
-    let cleanJson = result.data
+    let rawText = result.data;
+    rawText = rawText
       .replace(/```json/g, "")
       .replace(/```/g, "")
       .trim();
-    const analysisData = JSON.parse(cleanJson);
 
-    // Get hashtags separately for SEO
-    const gistResult = await client.gist({
-      videoId: videoId,
-      types: ["hashtag"],
-    });
-    analysisData.hashtags = gistResult.hashtags || [];
+    let analysisData;
+    try {
+      analysisData = JSON.parse(rawText);
+    } catch (e) {
+      console.error("JSON Parse Error:", rawText);
+      throw new Error("AI generated invalid format. Please try again.");
+    }
 
-    console.log("✅ Analysis Sent");
+    // Pass back the audience we actually used (whether user-typed or detected)
+    analysisData.detectedAudience = audience;
 
-    fs.unlink(filePath, () => {}); // Cleanup
+    try {
+      const gistResult = await client.gist({
+        videoId: videoId,
+        types: ["hashtag", "topic"],
+      });
+      analysisData.hashtags = gistResult.hashtags || [];
+      analysisData.topics = gistResult.topics || [];
+    } catch (err) {
+      console.log("Gist generation skipped:", err.message);
+      analysisData.hashtags = [];
+    }
+
+    console.log("✅ Analysis Complete");
+    fs.unlink(filePath, () => {});
     res.json(analysisData);
   } catch (error) {
     console.error("❌ Error:", error);
     if (fs.existsSync(filePath)) fs.unlink(filePath, () => {});
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: error.message || "Internal Server Error" });
   }
 });
 
-app.listen(port, () => console.log(`🚀 VidScore Engine on ${port}`));
+app.listen(port, () => console.log(`🚀 VidScore Premium Engine on ${port}`));
