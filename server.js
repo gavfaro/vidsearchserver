@@ -9,68 +9,42 @@ const app = express();
 const upload = multer({ dest: "/tmp/" });
 const port = process.env.PORT || 3000;
 
-// Validate API Key presence immediately
 if (!process.env.TWELVE_LABS_API_KEY) {
-  console.error(
-    "❌ CRITICAL ERROR: TWELVE_LABS_API_KEY is missing in .env file"
-  );
-  process.exit(1); // Exit if no API key
+  console.error("❌ CRITICAL: API KEY MISSING");
+  process.exit(1);
 }
 
-const client = new TwelveLabs({
-  apiKey: process.env.TWELVE_LABS_API_KEY,
-});
-
+const client = new TwelveLabs({ apiKey: process.env.TWELVE_LABS_API_KEY });
 app.use(cors());
 app.use(express.json());
 
-// --- SINGLE INDEX LOGIC ---
 let GLOBAL_INDEX_ID = null;
-const GLOBAL_INDEX_NAME = "VidTag";
+const GLOBAL_INDEX_NAME = "VidScore_Analysis";
 
-// Function to find existing index or create a new one ONCE
+// --- 1. SETUP INDEX ---
 const getOrCreateGlobalIndex = async () => {
   try {
-    console.log(`Checking for existing index named "${GLOBAL_INDEX_NAME}"...`);
-
-    // Try-catch around the list operation specifically
-    let indexes;
-    try {
-      // SDK uses 'indexes' (plural), not 'index'
-      indexes = await client.indexes.list();
-    } catch (listError) {
-      console.error("Error listing indexes:", listError.message);
-      throw new Error(
-        `Failed to list indexes. Check your API key and network connection. Details: ${listError.message}`
-      );
-    }
-
-    // Handle different SDK response structures
-    // API returns: { data: [...], page_info: {...} }
+    const indexes = await client.indexes.list();
     const indexList = Array.isArray(indexes) ? indexes : indexes?.data || [];
-
-    // SDK uses 'indexName' and 'id' fields (camelCase, not snake_case)
     const existingIndex = indexList.find(
       (i) => i.indexName === GLOBAL_INDEX_NAME
     );
 
     if (existingIndex) {
-      console.log(
-        `✅ Found existing index: ${existingIndex.indexName} (${existingIndex.id})`
-      );
       GLOBAL_INDEX_ID = existingIndex.id;
+      console.log(
+        `✅ Found existing index: ${GLOBAL_INDEX_NAME} (${GLOBAL_INDEX_ID})`
+      );
     } else {
       console.log(
-        `Index "${GLOBAL_INDEX_NAME}" not found. Creating new global index...`
+        `Index ${GLOBAL_INDEX_NAME} not found. Creating new one with Marengo 3.0...`
       );
-
-      // SDK expects: indexName (camelCase), models with modelName and modelOptions
       const newIndex = await client.indexes.create({
         indexName: GLOBAL_INDEX_NAME,
         models: [
           {
-            modelName: "marengo2.7",
-            modelOptions: ["visual", "audio"],
+            modelName: "marengo3.0",
+            modelOptions: ["visual", "audio", "text_in_video"],
           },
           {
             modelName: "pegasus1.2",
@@ -79,158 +53,258 @@ const getOrCreateGlobalIndex = async () => {
         ],
         addons: ["thumbnail"],
       });
-
       GLOBAL_INDEX_ID = newIndex.id;
-      console.log(`✅ Created new index: ${GLOBAL_INDEX_ID}`);
+      console.log(`✅ Created Index: ${GLOBAL_INDEX_ID}`);
     }
   } catch (error) {
-    console.error("❌ Error initializing index:", error.message);
-    console.error("Full error:", error);
-
-    // Don't exit process, but log clearly
-    console.error(
-      "⚠️  Server will continue but video processing will fail until index is initialized"
-    );
+    console.error("Index Error:", error.message);
   }
 };
 
-// Initialize index on server start - with error handling
 (async () => {
-  try {
-    await getOrCreateGlobalIndex();
-  } catch (error) {
-    console.error("Failed to initialize index on startup:", error);
-  }
+  await getOrCreateGlobalIndex();
 })();
 
-// --- ROUTES ---
+// --- 2. NICHE RULES ENGINE (HYBRID) ---
+const getNicheContext = (audience) => {
+  const normalizedAudience = audience ? audience.toLowerCase() : "general";
 
-app.post("/generate-post", upload.single("video"), async (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: "No video file provided" });
+  // Hardcoded rules for high-value niches
+  const rules = {
+    "real estate": `
+      - VISUALS: Look for high-quality wide angles, smooth drone shots, or bright interior lighting.
+      - PACING: Should be elegant and smooth, not frantic.
+      - HOOK: Must show the "hero shot" (front of house or best room) immediately or overlay text with price/location.
+      - AUDIO: clear voiceover or trending luxury audio.
+      - FAILURE POINTS: Dark lighting, shaky camera, clutter in rooms.
+    `,
+    fitness: `
+      - VISUALS: Needs to show physique or movement clearly.
+      - PACING: Fast, energetic, cuts on the beat of the music.
+      - HOOK: Needs to show the "result" (the six-pack) or the "struggle" (the heavy weight) in the first second.
+      - AUDIO: High energy music or ASMR gym sounds.
+      - FAILURE POINTS: Bad form, boring rest periods left in, bad camera angle.
+    `,
+    tech: `
+      - VISUALS: Clean desk setup, clear screen recordings, high contrast.
+      - PACING: Very fast, information-dense.
+      - HOOK: Show the "cool gadget" or the "final code result" immediately.
+      - AUDIO: Crisp voiceover is mandatory. 
+      - FAILURE POINTS: Blurry screens, slow typing, monotone voice.
+    `,
+    beauty: `
+      - VISUALS: Perfect lighting (ring light), close-ups of texture.
+      - PACING: Transitions (swipes, finger snaps) are critical.
+      - HOOK: Before/After result shown instantly.
+      - FAILURE POINTS: Bad color grading, messy background.
+    `,
+    business: `
+      - VISUALS: Talking head, but must have dynamic captions.
+      - PACING: No pauses. "Millennial Pause" at start is a critical failure.
+      - HOOK: A controversial statement or a specific "How to" promise.
+      - FAILURE POINTS: looking away from camera, slow start, boring background.
+    `,
+    pets: `
+      - VISUALS: Cute close-ups, funny movements.
+      - PACING: Chaos is good.
+      - HOOK: The funny action must happen immediately.
+      - FAILURE POINTS: Human talking too much, camera too far away.
+    `,
+  };
+
+  // 1. Check strict hardcoded matches
+  for (const [key, value] of Object.entries(rules)) {
+    if (normalizedAudience.includes(key)) return value;
   }
 
-  // Ensure we have an index to upload to
-  if (!GLOBAL_INDEX_ID) {
-    console.log("Index not initialized, attempting to initialize now...");
-    await getOrCreateGlobalIndex();
-
-    if (!GLOBAL_INDEX_ID) {
-      return res.status(500).json({
-        error:
-          "Server failed to initialize Index. Please check API key and try again.",
-        details: "The TwelveLabs index could not be created or accessed.",
-      });
-    }
+  // 2. Dynamic Handle: User typed something specific
+  if (normalizedAudience !== "general" && normalizedAudience !== "") {
+    return `
+      - CONTEXT: The user explicitly stated this video is for the "${audience}" niche.
+      - INSTRUCTION: Use your internal knowledge of ${audience} content on social media.
+      - CRITERIA: Judge the hook, pacing, and visuals based on what currently performs well for ${audience}.
+      `;
   }
+
+  // 3. Fallback
+  return `
+      - VISUALS: Clear, bright, high definition.
+      - PACING: Remove all dead air and pauses.
+      - HOOK: Visual movement or text overlay in first 3 seconds.
+  `;
+};
+
+// --- 3. AUTO-DETECT NICHE HELPER ---
+const detectVideoNiche = async (videoId) => {
+  try {
+    // ✅ FIX: Switched from client.generate.text to client.analyze
+    const result = await client.analyze({
+      videoId: videoId,
+      prompt: `
+            Analyze this video and categorize it into exactly one of these niches:
+            'Real Estate', 'Fitness', 'Tech', 'Beauty', 'Business', 'Pets'.
+            
+            If it is clearly one of these, return ONLY the category name.
+            If it does not fit these but has a clear theme, return that theme name (e.g. 'Cooking', 'Gaming').
+            If it is unclear, return 'General'.
+            `,
+      temperature: 0.1,
+    });
+
+    // Ensure we handle result.data correctly depending on SDK version
+    const detected = (result.data || result.content || "").trim();
+    console.log(`🤖 AI Auto-Detected Niche: ${detected}`);
+    return detected;
+  } catch (e) {
+    console.log("Auto-detect failed, defaulting to General. Error:", e.message);
+    return "General";
+  }
+};
+
+// --- 4. THE PROMPT ---
+const GENERATE_PREMIUM_PROMPT = (audience, platform, nicheInstructions) => `
+You are a top-tier Viral Video Consultant for ${platform} specializing in the "${audience}" niche.
+Your goal is to critique this video specifically against the standards of top performers in ${audience}.
+
+*** NICHE SPECIFIC STANDARDS FOR ${audience.toUpperCase()} ***
+${nicheInstructions}
+************************************************************
+
+Step 1: Analyze the "Hook" (0:00 to 0:03) based on the Niche Standards above.
+- Does it match the niche expectation? (e.g., Luxury Real Estate needs elegance, Fitness needs energy).
+- Is the text/visual clear?
+
+Step 2: Analyze Technical Execution.
+- Lighting, Composition, and Audio Quality compared to top ${audience} creators.
+
+Step 3: Provide Analytics.
+Generate a strict JSON response.
+Rules:
+- "hookAnalysis": Be specific to the niche. (e.g., "For a Real Estate video, this pan was too fast/shaky").
+- "virality": Compare it to viral hits in this specific category.
+
+Output format (Raw JSON only):
+{
+  "overallScore": (integer 0-100),
+  "hookScore": (integer 0-10),
+  "visualScore": (integer 0-10),
+  "audioScore": (integer 0-10),
+  "audienceMatchScore": (integer 0-10),
+  "predictedRetention": [100, 85, 70, 60, 50, 40],
+  "hookAnalysis": {
+    "status": "Weak" | "Strong",
+    "timestamp": "0:00-0:03",
+    "feedback": "Critique based on niche standards."
+  },
+  "criticalIssues": [
+    "Issue 1",
+    "Issue 2"
+  ],
+  "actionableFixes": [
+    "Fix 1",
+    "Fix 2"
+  ],
+  "captionSuggestion": "Viral caption relevant to niche",
+  "viralPotential": "Low" | "Medium" | "High"
+}
+`;
+
+app.post("/analyze-video", upload.single("video"), async (req, res) => {
+  if (!req.file || !GLOBAL_INDEX_ID)
+    return res.status(400).json({ error: "System not ready" });
 
   const filePath = req.file.path;
-  const userPrompt =
-    req.body.prompt || "Write a social media summary for this video.";
-  const platform = req.body.platform || "Custom";
+  let { audience, platform } = req.body;
 
   try {
-    console.log(`[1/3] Uploading Video to Index ${GLOBAL_INDEX_ID}...`);
-
-    // SDK uses client.tasks.create (plural), not client.task.create
+    console.log(`[1] Uploading...`);
     const task = await client.tasks.create({
       indexId: GLOBAL_INDEX_ID,
       videoFile: fs.createReadStream(filePath),
     });
 
-    const taskId = task.id || task._id;
-    console.log(`[2/3] Indexing Task ID: ${taskId}. Waiting...`);
+    console.log(`[2] Processing Task: ${task.id}`);
 
-    // Poll for task completion
-    let taskStatus;
     let attempts = 0;
-    const maxAttempts = 150; // 5 minutes max (150 * 2 seconds)
-
-    while (attempts < maxAttempts) {
-      taskStatus = await client.tasks.retrieve(taskId);
-      console.log(`  Status: ${taskStatus.status}`);
-
-      if (taskStatus.status === "ready") {
+    let videoId = null;
+    while (attempts < 60) {
+      const status = await client.tasks.retrieve(task.id);
+      if (status.status === "ready") {
+        videoId = status.videoId;
         break;
-      } else if (taskStatus.status === "failed") {
-        throw new Error("Task failed during processing");
       }
-
-      // Wait 2 seconds before checking again
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+      if (status.status === "failed") {
+        throw new Error(
+          `Processing failed: ${status.processStatus || "Unknown error"}`
+        );
+      }
+      await new Promise((r) => setTimeout(r, 2000));
       attempts++;
     }
 
-    if (attempts >= maxAttempts) {
-      throw new Error("Task timed out after 5 minutes");
+    if (!videoId) throw new Error("Processing Timeout");
+
+    // --- HYBRID LOGIC ---
+    const isUserProvided =
+      audience &&
+      audience.trim() !== "" &&
+      audience.toLowerCase() !== "general" &&
+      audience.toLowerCase() !== "unknown";
+
+    if (!isUserProvided) {
+      console.log("[3a] No audience provided. Auto-detecting...");
+      audience = await detectVideoNiche(videoId);
+    } else {
+      console.log(`[3a] User manually specified: ${audience}`);
     }
 
-    const videoId = taskStatus.videoId || taskStatus.video_id;
-    console.log(`[3/3] Video Indexed: ${videoId}. Generating Content...`);
+    const nicheInstructions = getNicheContext(audience);
 
-    // --- Generate Caption using analyze (open-ended analysis) ---
-    const captionPromise = client.analyze({
+    // ✅ FIX: Switched from client.generate.text to client.analyze
+    const result = await client.analyze({
       videoId: videoId,
-      prompt: userPrompt,
-      temperature: 0.7,
+      prompt: GENERATE_PREMIUM_PROMPT(audience, platform, nicheInstructions),
+      temperature: 0.2, // Low temp for JSON consistency
     });
 
-    // --- Generate Hashtags using gist ---
-    const hashtagPromise = client.gist({
-      videoId: videoId,
-      types: ["hashtag", "topic"],
-    });
+    // Handle data structure safely
+    let rawText = result.data || result.content || "";
 
-    const [captionResult, hashtagResult] = await Promise.all([
-      captionPromise,
-      hashtagPromise,
-    ]);
+    rawText = rawText
+      .replace(/```json/g, "")
+      .replace(/```/g, "")
+      .trim();
 
-    // Extract caption from analyze response
-    const caption = captionResult.data || "";
+    let analysisData;
+    try {
+      analysisData = JSON.parse(rawText);
+    } catch (e) {
+      console.error("JSON Parse Error:", rawText);
+      throw new Error("AI generated invalid format. Please try again.");
+    }
 
-    // Extract hashtags from gist response
-    const hashtagsArray = hashtagResult.hashtags || [];
-    const topicsArray = hashtagResult.topics || [];
+    analysisData.detectedAudience = audience;
 
-    const responseData = {
-      platform: platform,
-      caption: caption.trim(),
-      hashtags: hashtagsArray,
-      topics: topicsArray,
-    };
+    try {
+      const gistResult = await client.gist({
+        videoId: videoId,
+        types: ["hashtag", "topic"],
+      });
+      analysisData.hashtags = gistResult.hashtags || [];
+      analysisData.topics = gistResult.topics || [];
+    } catch (err) {
+      console.log("Gist generation skipped:", err.message);
+      analysisData.hashtags = [];
+    }
 
-    console.log(
-      `✅ Success! Caption: ${responseData.caption.substring(0, 50)}...`
-    );
-
-    // Clean up the uploaded file
-    fs.unlink(filePath, (err) => {
-      if (err) console.error("Error deleting temp file:", err);
-    });
-
-    res.json(responseData);
+    console.log("✅ Analysis Complete");
+    fs.unlink(filePath, () => {});
+    res.json(analysisData);
   } catch (error) {
-    console.error("❌ Error processing video:", error);
-    if (fs.existsSync(filePath)) {
-      fs.unlink(filePath, () => {});
-    }
-    res.status(500).json({
-      error: error.message,
-      details: "Video processing failed. Check server logs for details.",
-    });
+    console.error("❌ Error:", error);
+    if (fs.existsSync(filePath)) fs.unlink(filePath, () => {});
+    res.status(500).json({ error: error.message || "Internal Server Error" });
   }
 });
 
-// Health check endpoint
-app.get("/health", (req, res) => {
-  res.json({
-    status: "ok",
-    indexInitialized: !!GLOBAL_INDEX_ID,
-    indexId: GLOBAL_INDEX_ID,
-  });
-});
-
-app.listen(port, () => {
-  console.log(`🚀 Server running on port ${port}`);
-});
+app.listen(port, () => console.log(`🚀 VidScore Premium Engine on ${port}`));
