@@ -9,228 +9,151 @@ const app = express();
 const upload = multer({ dest: "/tmp/" });
 const port = process.env.PORT || 3000;
 
-// Validate API Key presence immediately
 if (!process.env.TWELVE_LABS_API_KEY) {
-  console.error(
-    "❌ CRITICAL ERROR: TWELVE_LABS_API_KEY is missing in .env file"
-  );
-  process.exit(1); // Exit if no API key
+  console.error("❌ CRITICAL: API KEY MISSING");
+  process.exit(1);
 }
 
-const client = new TwelveLabs({
-  apiKey: process.env.TWELVE_LABS_API_KEY,
-});
-
+const client = new TwelveLabs({ apiKey: process.env.TWELVE_LABS_API_KEY });
 app.use(cors());
 app.use(express.json());
 
-// --- SINGLE INDEX LOGIC ---
 let GLOBAL_INDEX_ID = null;
-const GLOBAL_INDEX_NAME = "VidTag";
+const GLOBAL_INDEX_NAME = "VidScore_Analysis";
 
-// Function to find existing index or create a new one ONCE
+// --- 1. SETUP INDEX ---
 const getOrCreateGlobalIndex = async () => {
   try {
-    console.log(`Checking for existing index named "${GLOBAL_INDEX_NAME}"...`);
-
-    // Try-catch around the list operation specifically
-    let indexes;
-    try {
-      // SDK uses 'indexes' (plural), not 'index'
-      indexes = await client.indexes.list();
-    } catch (listError) {
-      console.error("Error listing indexes:", listError.message);
-      throw new Error(
-        `Failed to list indexes. Check your API key and network connection. Details: ${listError.message}`
-      );
-    }
-
-    // Handle different SDK response structures
-    // API returns: { data: [...], page_info: {...} }
+    const indexes = await client.indexes.list();
     const indexList = Array.isArray(indexes) ? indexes : indexes?.data || [];
-
-    // SDK uses 'indexName' and 'id' fields (camelCase, not snake_case)
     const existingIndex = indexList.find(
       (i) => i.indexName === GLOBAL_INDEX_NAME
     );
 
     if (existingIndex) {
-      console.log(
-        `✅ Found existing index: ${existingIndex.indexName} (${existingIndex.id})`
-      );
       GLOBAL_INDEX_ID = existingIndex.id;
+      console.log(`✅ Using Index: ${GLOBAL_INDEX_ID}`);
     } else {
-      console.log(
-        `Index "${GLOBAL_INDEX_NAME}" not found. Creating new global index...`
-      );
-
-      // SDK expects: indexName (camelCase), models with modelName and modelOptions
+      console.log(`Creating new index...`);
       const newIndex = await client.indexes.create({
         indexName: GLOBAL_INDEX_NAME,
         models: [
           {
             modelName: "marengo2.7",
-            modelOptions: ["visual", "audio"],
+            modelOptions: ["visual", "audio", "text"],
           },
-          {
-            modelName: "pegasus1.2",
-            modelOptions: ["visual", "audio"],
-          },
+          { modelName: "pegasus1.2", modelOptions: ["visual", "audio"] },
         ],
         addons: ["thumbnail"],
       });
-
       GLOBAL_INDEX_ID = newIndex.id;
-      console.log(`✅ Created new index: ${GLOBAL_INDEX_ID}`);
+      console.log(`✅ Created Index: ${GLOBAL_INDEX_ID}`);
     }
   } catch (error) {
-    console.error("❌ Error initializing index:", error.message);
-    console.error("Full error:", error);
-
-    // Don't exit process, but log clearly
-    console.error(
-      "⚠️  Server will continue but video processing will fail until index is initialized"
-    );
+    console.error("Index Error:", error.message);
   }
 };
 
-// Initialize index on server start - with error handling
 (async () => {
-  try {
-    await getOrCreateGlobalIndex();
-  } catch (error) {
-    console.error("Failed to initialize index on startup:", error);
-  }
+  await getOrCreateGlobalIndex();
 })();
 
-// --- ROUTES ---
+// --- 2. THE MEGA PROMPT ---
+// This instructs the AI to return strictly formatted JSON data
+const ANALYSIS_PROMPT = (audience, platform) => `
+You are a viral video consultant for ${platform}. The target audience is: ${audience}.
+Analyze this video strictly. Do not be nice. Be accurate.
 
-app.post("/generate-post", upload.single("video"), async (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: "No video file provided" });
-  }
+Return a valid JSON object (no markdown, no code blocks, just raw JSON) with this exact structure:
+{
+  "overallScore": (number 0-100),
+  "hookScore": (number 0-10),
+  "visualScore": (number 0-10),
+  "audioScore": (number 0-10),
+  "audienceMatchScore": (number 0-10),
+  "predictedRetention": [ (array of 6 numbers from 100 down to X representing viewer % at 0s, 5s, 10s, 15s, 20s, 25s+) ],
+  "hookAnalysis": {
+    "status": "Weak" or "Strong",
+    "timestamp": "0:03",
+    "feedback": "string explaining the hook issue or strength"
+  },
+  "criticalIssues": [
+    "string 1 (major issue)",
+    "string 2 (major issue)"
+  ],
+  "actionableFixes": [
+    "string 1 (specific edit to make)",
+    "string 2 (specific edit to make)"
+  ],
+  "captionSuggestion": "A viral style caption",
+  "viralPotential": "Low", "Medium", or "High"
+}
+`;
 
-  // Ensure we have an index to upload to
-  if (!GLOBAL_INDEX_ID) {
-    console.log("Index not initialized, attempting to initialize now...");
-    await getOrCreateGlobalIndex();
-
-    if (!GLOBAL_INDEX_ID) {
-      return res.status(500).json({
-        error:
-          "Server failed to initialize Index. Please check API key and try again.",
-        details: "The TwelveLabs index could not be created or accessed.",
-      });
-    }
-  }
+app.post("/analyze-video", upload.single("video"), async (req, res) => {
+  if (!req.file || !GLOBAL_INDEX_ID)
+    return res.status(400).json({ error: "Not ready" });
 
   const filePath = req.file.path;
-  const userPrompt =
-    req.body.prompt || "Write a social media summary for this video.";
-  const platform = req.body.platform || "Custom";
+  const { audience, platform } = req.body;
 
   try {
-    console.log(`[1/3] Uploading Video to Index ${GLOBAL_INDEX_ID}...`);
-
-    // SDK uses client.tasks.create (plural), not client.task.create
+    console.log(`[1] Uploading...`);
     const task = await client.tasks.create({
       indexId: GLOBAL_INDEX_ID,
       videoFile: fs.createReadStream(filePath),
     });
 
-    const taskId = task.id || task._id;
-    console.log(`[2/3] Indexing Task ID: ${taskId}. Waiting...`);
+    console.log(`[2] Processing Task: ${task.id}`);
 
-    // Poll for task completion
-    let taskStatus;
+    // Polling Loop
     let attempts = 0;
-    const maxAttempts = 150; // 5 minutes max (150 * 2 seconds)
-
-    while (attempts < maxAttempts) {
-      taskStatus = await client.tasks.retrieve(taskId);
-      console.log(`  Status: ${taskStatus.status}`);
-
-      if (taskStatus.status === "ready") {
+    let videoId = null;
+    while (attempts < 60) {
+      const status = await client.tasks.retrieve(task.id);
+      if (status.status === "ready") {
+        videoId = status.videoId;
         break;
-      } else if (taskStatus.status === "failed") {
-        throw new Error("Task failed during processing");
       }
-
-      // Wait 2 seconds before checking again
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+      if (status.status === "failed") throw new Error("Processing failed");
+      await new Promise((r) => setTimeout(r, 2000));
       attempts++;
     }
 
-    if (attempts >= maxAttempts) {
-      throw new Error("Task timed out after 5 minutes");
-    }
+    if (!videoId) throw new Error("Timeout");
 
-    const videoId = taskStatus.videoId || taskStatus.video_id;
-    console.log(`[3/3] Video Indexed: ${videoId}. Generating Content...`);
+    console.log(`[3] Analyzing Video ID: ${videoId}`);
 
-    // --- Generate Caption using analyze (open-ended analysis) ---
-    const captionPromise = client.analyze({
+    // Use GENERATE (Pegasus) for deep reasoning
+    const result = await client.generate.text({
       videoId: videoId,
-      prompt: userPrompt,
-      temperature: 0.7,
+      prompt: ANALYSIS_PROMPT(audience, platform),
+      temperature: 0.2, // Low temp for consistent JSON
     });
 
-    // --- Generate Hashtags using gist ---
-    const hashtagPromise = client.gist({
+    // Clean the output to ensure it's valid JSON
+    let cleanJson = result.data
+      .replace(/```json/g, "")
+      .replace(/```/g, "")
+      .trim();
+    const analysisData = JSON.parse(cleanJson);
+
+    // Get hashtags separately for SEO
+    const gistResult = await client.gist({
       videoId: videoId,
-      types: ["hashtag", "topic"],
+      types: ["hashtag"],
     });
+    analysisData.hashtags = gistResult.hashtags || [];
 
-    const [captionResult, hashtagResult] = await Promise.all([
-      captionPromise,
-      hashtagPromise,
-    ]);
+    console.log("✅ Analysis Sent");
 
-    // Extract caption from analyze response
-    const caption = captionResult.data || "";
-
-    // Extract hashtags from gist response
-    const hashtagsArray = hashtagResult.hashtags || [];
-    const topicsArray = hashtagResult.topics || [];
-
-    const responseData = {
-      platform: platform,
-      caption: caption.trim(),
-      hashtags: hashtagsArray,
-      topics: topicsArray,
-    };
-
-    console.log(
-      `✅ Success! Caption: ${responseData.caption.substring(0, 50)}...`
-    );
-
-    // Clean up the uploaded file
-    fs.unlink(filePath, (err) => {
-      if (err) console.error("Error deleting temp file:", err);
-    });
-
-    res.json(responseData);
+    fs.unlink(filePath, () => {}); // Cleanup
+    res.json(analysisData);
   } catch (error) {
-    console.error("❌ Error processing video:", error);
-    if (fs.existsSync(filePath)) {
-      fs.unlink(filePath, () => {});
-    }
-    res.status(500).json({
-      error: error.message,
-      details: "Video processing failed. Check server logs for details.",
-    });
+    console.error("❌ Error:", error);
+    if (fs.existsSync(filePath)) fs.unlink(filePath, () => {});
+    res.status(500).json({ error: error.message });
   }
 });
 
-// Health check endpoint
-app.get("/health", (req, res) => {
-  res.json({
-    status: "ok",
-    indexInitialized: !!GLOBAL_INDEX_ID,
-    indexId: GLOBAL_INDEX_ID,
-  });
-});
-
-app.listen(port, () => {
-  console.log(`🚀 Server running on port ${port}`);
-});
+app.listen(port, () => console.log(`🚀 VidScore Engine on ${port}`));
