@@ -39,8 +39,8 @@ const getOrCreateGlobalIndex = async () => {
         indexName: GLOBAL_INDEX_NAME,
         models: [
           {
-            modelName: "marengo2.7",
-            modelOptions: ["visual", "audio", "text"],
+            modelName: "marengo3.0", // ✅ Updated to Marengo 3.0
+            modelOptions: ["visual", "audio"],
           },
           { modelName: "pegasus1.2", modelOptions: ["visual", "audio"] },
         ],
