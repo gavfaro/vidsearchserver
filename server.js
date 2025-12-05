@@ -132,7 +132,7 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
 
     // We explicitly ask Twelve Labs to separate Dialogue from Background Audio in its description
     const [summaryResult, gistResult] = await Promise.all([
-      client.generate.text({
+      client.analyze({
         videoId: videoId,
         prompt: `
           Analyze this video for a professional critique.
