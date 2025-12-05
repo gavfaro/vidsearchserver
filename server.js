@@ -9,6 +9,13 @@ const app = express();
 const upload = multer({ dest: "/tmp/" });
 const port = process.env.PORT || 3000;
 
+// Validate API Key presence immediately
+if (!process.env.TWELVE_LABS_API_KEY) {
+  console.error(
+    "❌ CRITICAL ERROR: TWELVE_LABS_API_KEY is missing in .env file"
+  );
+}
+
 const client = new TwelveLabs({
   apiKey: process.env.TWELVE_LABS_API_KEY || "",
 });
@@ -24,13 +31,20 @@ const GLOBAL_INDEX_NAME = "VidTag"; // Updated Index Name
 // Function to find existing index or create a new one ONCE
 const getOrCreateGlobalIndex = async () => {
   try {
+    // Safety check: Ensure the SDK client is properly initialized
+    if (!client.index) {
+      throw new Error(
+        "TwelveLabs SDK 'index' property is undefined. Check your API Key and SDK version."
+      );
+    }
+
     console.log(`Checking for existing index named "${GLOBAL_INDEX_NAME}"...`);
     const indexes = await client.index.list();
 
     // Check if our specific index already exists
-    const existingIndex = indexes.data.find(
-      (i) => i.name === GLOBAL_INDEX_NAME
-    );
+    // Note: Adjust based on SDK response structure if needed (e.g. some versions return array directly)
+    const indexList = Array.isArray(indexes) ? indexes : indexes.data || [];
+    const existingIndex = indexList.find((i) => i.name === GLOBAL_INDEX_NAME);
 
     if (existingIndex) {
       console.log(
