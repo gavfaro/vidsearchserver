@@ -61,11 +61,11 @@ app.post("/generate-post", upload.single("video"), async (req, res) => {
       models: [
         {
           modelName: "marengo2.7", // Using 2.7 or 2.6 is often faster/cheaper for indexing, adjust as needed
-          modelOptions: ["visual", "audio", "conversation"],
+          modelOptions: ["visual", "audio"],
         },
         {
           modelName: "pegasus1.2", // Essential for the 'analyze' call
-          modelOptions: ["visual", "audio", "conversation"],
+          modelOptions: ["visual", "audio"],
         },
       ],
     });
