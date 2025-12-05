@@ -66,9 +66,20 @@ const getOrCreateGlobalIndex = async () => {
   }
 };
 
-(async () => {
+const startServer = async () => {
   await getOrCreateGlobalIndex();
-})();
+
+  if (!GLOBAL_INDEX_ID) {
+    console.error(
+      "❌ Could not initialize index. Check API key or permissions."
+    );
+    process.exit(1);
+  }
+
+  app.listen(port, () => console.log(`🚀 VidScore Premium Engine on ${port}`));
+};
+
+startServer();
 
 // --- LAYER 1: FORENSIC AGENT (Search) ---
 // Actively hunts for bad quality footage
