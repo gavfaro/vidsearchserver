@@ -288,7 +288,9 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
     );
 
     // Using `analyze` (or generate.text depending on SDK version)
-    const result = await client.generate.text(videoId, prompt, {
+    const result = await client.analyze({
+      videoId: videoId,
+      prompt: prompt,
       temperature: 0.2,
     });
 
