@@ -13,7 +13,7 @@ const client = new TwelveLabs({ apiKey: process.env.TWELVE_LABS_API_KEY });
 app.use(cors());
 app.use(express.json());
 
-const INDEX_NAME = "VidScore_Premium_Index";
+const INDEX_NAME = "VidScore_Analysis";
 let GLOBAL_INDEX_ID = null;
 
 // 1. Ensure Index uses Marengo 3.0 (Critical for Search) and Pegasus 1.2
@@ -31,7 +31,7 @@ const initIndex = async () => {
       indexName: INDEX_NAME,
       models: [
         // ✅ FIXED: modelOptions must only contain 'visual' and 'audio'
-        { modelName: "marengo2.7", modelOptions: ["visual", "audio"] },
+        { modelName: "marengo3.0", modelOptions: ["visual", "audio"] },
         { modelName: "pegasus1.2", modelOptions: ["visual", "audio"] },
       ],
     });
