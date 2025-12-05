@@ -124,8 +124,8 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
 
     console.log(`[3] Analyzing Video ID: ${videoId}`);
 
-    // Use GENERATE (Pegasus) for deep reasoning
-    const result = await client.generate.text({
+    // ✅ FIXED: Use client.analyze() instead of client.generate.text()
+    const result = await client.analyze({
       videoId: videoId,
       prompt: ANALYSIS_PROMPT(audience, platform),
       temperature: 0.2, // Low temp for consistent JSON
