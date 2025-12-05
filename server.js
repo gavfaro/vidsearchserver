@@ -14,70 +14,93 @@ if (!process.env.TWELVE_LABS_API_KEY) {
   console.error(
     "❌ CRITICAL ERROR: TWELVE_LABS_API_KEY is missing in .env file"
   );
+  process.exit(1); // Exit if no API key
 }
 
 const client = new TwelveLabs({
-  apiKey: process.env.TWELVE_LABS_API_KEY || "",
+  apiKey: process.env.TWELVE_LABS_API_KEY,
 });
 
 app.use(cors());
 app.use(express.json());
 
 // --- SINGLE INDEX LOGIC ---
-// We will store the Index ID here so we don't keep creating new ones.
 let GLOBAL_INDEX_ID = null;
-const GLOBAL_INDEX_NAME = "VidTag"; // Updated Index Name
+const GLOBAL_INDEX_NAME = "VidTag";
 
 // Function to find existing index or create a new one ONCE
 const getOrCreateGlobalIndex = async () => {
   try {
-    // Safety check: Ensure the SDK client is properly initialized
-    if (!client.index) {
+    console.log(`Checking for existing index named "${GLOBAL_INDEX_NAME}"...`);
+
+    // Try-catch around the list operation specifically
+    let indexes;
+    try {
+      indexes = await client.index.list();
+    } catch (listError) {
+      console.error("Error listing indexes:", listError.message);
       throw new Error(
-        "TwelveLabs SDK 'index' property is undefined. Check your API Key and SDK version."
+        `Failed to list indexes. Check your API key and network connection. Details: ${listError.message}`
       );
     }
 
-    console.log(`Checking for existing index named "${GLOBAL_INDEX_NAME}"...`);
-    const indexes = await client.index.list();
+    // Handle different SDK response structures
+    // API returns: { data: [...], page_info: {...} }
+    const indexList = Array.isArray(indexes) ? indexes : indexes?.data || [];
 
-    // Check if our specific index already exists
-    // Note: Adjust based on SDK response structure if needed (e.g. some versions return array directly)
-    const indexList = Array.isArray(indexes) ? indexes : indexes.data || [];
-    const existingIndex = indexList.find((i) => i.name === GLOBAL_INDEX_NAME);
+    // API uses 'index_name' and '_id' fields
+    const existingIndex = indexList.find(
+      (i) => i.index_name === GLOBAL_INDEX_NAME
+    );
 
     if (existingIndex) {
       console.log(
-        `Found existing index: ${existingIndex.name} (${existingIndex.id})`
+        `✅ Found existing index: ${existingIndex.index_name} (${existingIndex._id})`
       );
-      GLOBAL_INDEX_ID = existingIndex.id;
+      GLOBAL_INDEX_ID = existingIndex._id;
     } else {
       console.log(
         `Index "${GLOBAL_INDEX_NAME}" not found. Creating new global index...`
       );
+
+      // API expects: index_name, models (with model_name and model_options)
       const newIndex = await client.index.create({
-        name: GLOBAL_INDEX_NAME,
+        index_name: GLOBAL_INDEX_NAME,
         models: [
           {
-            modelName: "marengo2.7",
-            modelOptions: ["visual", "audio"],
+            model_name: "marengo3.0",
+            model_options: ["visual", "audio"],
           },
           {
-            modelName: "pegasus1.2",
-            modelOptions: ["visual", "audio"],
+            model_name: "pegasus1.2",
+            model_options: ["visual", "audio"],
           },
         ],
+        addons: ["thumbnail"],
       });
-      GLOBAL_INDEX_ID = newIndex.id;
-      console.log(`Created new index: ${GLOBAL_INDEX_ID}`);
+
+      GLOBAL_INDEX_ID = newIndex._id;
+      console.log(`✅ Created new index: ${GLOBAL_INDEX_ID}`);
     }
   } catch (error) {
-    console.error("Error initializing index:", error);
+    console.error("❌ Error initializing index:", error.message);
+    console.error("Full error:", error);
+
+    // Don't exit process, but log clearly
+    console.error(
+      "⚠️  Server will continue but video processing will fail until index is initialized"
+    );
   }
 };
 
-// Initialize index on server start
-getOrCreateGlobalIndex();
+// Initialize index on server start - with error handling
+(async () => {
+  try {
+    await getOrCreateGlobalIndex();
+  } catch (error) {
+    console.error("Failed to initialize index on startup:", error);
+  }
+})();
 
 // --- PROMPTS ---
 
@@ -99,16 +122,19 @@ app.post("/generate-post", upload.single("video"), async (req, res) => {
 
   // Ensure we have an index to upload to
   if (!GLOBAL_INDEX_ID) {
-    await getOrCreateGlobalIndex(); // Try one more time if it failed at startup
+    console.log("Index not initialized, attempting to initialize now...");
+    await getOrCreateGlobalIndex();
+
     if (!GLOBAL_INDEX_ID) {
-      return res
-        .status(500)
-        .json({ error: "Server failed to initialize Index" });
+      return res.status(500).json({
+        error:
+          "Server failed to initialize Index. Please check API key and try again.",
+        details: "The TwelveLabs index could not be created or accessed.",
+      });
     }
   }
 
   const filePath = req.file.path;
-  // We now accept the custom prompt directly from the UI
   const userPrompt =
     req.body.prompt || "Write a social media summary for this video.";
   const platform = req.body.platform || "Custom";
@@ -124,7 +150,7 @@ app.post("/generate-post", upload.single("video"), async (req, res) => {
     console.log(`[2/3] Indexing Task ID: ${task.id}. Waiting...`);
 
     await task.waitForDone({
-      sleepInterval: 2, // Check every 2 seconds
+      sleepInterval: 2,
       callback: (taskUpdate) => {
         console.log(`  Status: ${taskUpdate.status}`);
       },
@@ -133,15 +159,13 @@ app.post("/generate-post", upload.single("video"), async (req, res) => {
     const videoId = task.videoId;
     console.log(`[3/3] Video Indexed: ${videoId}. Generating Content...`);
 
-    // --- STEP 1: Generate Caption (Pegasus) ---
-    // Use the USER PROVIDED prompt
+    // --- Generate Caption and Hashtags in parallel ---
     const captionPromise = client.generate.text({
       videoId: videoId,
       prompt: userPrompt,
       temperature: 0.7,
     });
 
-    // --- STEP 2: Generate Hashtags (Pegasus) ---
     const hashtagPromise = client.generate.text({
       videoId: videoId,
       prompt: getHashtagPrompt(),
@@ -170,7 +194,7 @@ app.post("/generate-post", upload.single("video"), async (req, res) => {
     };
 
     console.log(
-      `Success! Caption: ${responseData.caption.substring(0, 20)}...`
+      `✅ Success! Caption: ${responseData.caption.substring(0, 50)}...`
     );
 
     // Clean up the uploaded file
@@ -178,18 +202,28 @@ app.post("/generate-post", upload.single("video"), async (req, res) => {
       if (err) console.error("Error deleting temp file:", err);
     });
 
-    // Note: We DO NOT delete the index anymore. We keep it for the next request.
-
     res.json(responseData);
   } catch (error) {
-    console.error("Error processing video:", error);
+    console.error("❌ Error processing video:", error);
     if (fs.existsSync(filePath)) {
       fs.unlink(filePath, () => {});
     }
-    res.status(500).json({ error: error.message });
+    res.status(500).json({
+      error: error.message,
+      details: "Video processing failed. Check server logs for details.",
+    });
   }
 });
 
+// Health check endpoint
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    indexInitialized: !!GLOBAL_INDEX_ID,
+    indexId: GLOBAL_INDEX_ID,
+  });
+});
+
 app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+  console.log(`🚀 Server running on port ${port}`);
 });
