@@ -149,16 +149,34 @@ app.post("/generate-post", upload.single("video"), async (req, res) => {
       videoFile: fs.createReadStream(filePath),
     });
 
-    console.log(`[2/3] Indexing Task ID: ${task.id}. Waiting...`);
+    const taskId = task.id || task._id;
+    console.log(`[2/3] Indexing Task ID: ${taskId}. Waiting...`);
 
-    await task.waitForDone({
-      sleepInterval: 2,
-      callback: (taskUpdate) => {
-        console.log(`  Status: ${taskUpdate.status}`);
-      },
-    });
+    // Poll for task completion
+    let taskStatus;
+    let attempts = 0;
+    const maxAttempts = 150; // 5 minutes max (150 * 2 seconds)
 
-    const videoId = task.videoId;
+    while (attempts < maxAttempts) {
+      taskStatus = await client.tasks.retrieve(taskId);
+      console.log(`  Status: ${taskStatus.status}`);
+
+      if (taskStatus.status === "ready") {
+        break;
+      } else if (taskStatus.status === "failed") {
+        throw new Error("Task failed during processing");
+      }
+
+      // Wait 2 seconds before checking again
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      attempts++;
+    }
+
+    if (attempts >= maxAttempts) {
+      throw new Error("Task timed out after 5 minutes");
+    }
+
+    const videoId = taskStatus.videoId || taskStatus.video_id;
     console.log(`[3/3] Video Indexed: ${videoId}. Generating Content...`);
 
     // --- Generate Caption and Hashtags in parallel ---
