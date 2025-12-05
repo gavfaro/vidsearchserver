@@ -270,7 +270,13 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
         }
         break;
       }
-      if (status.status === "failed") throw new Error("Indexing Failed");
+      if (status.status === "failed") {
+        console.error("❌ Indexing failed:", JSON.stringify(status, null, 2));
+        throw new Error(
+          `Indexing Failed: ${status.processStatus || "Unknown reason"}`
+        );
+      }
+
       await new Promise((r) => setTimeout(r, 1000));
     }
 
