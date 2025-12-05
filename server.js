@@ -3,25 +3,37 @@ import multer from "multer";
 import cors from "cors";
 import fs from "fs";
 import { TwelveLabs } from "twelvelabs-js";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import "dotenv/config";
 
 const app = express();
 const upload = multer({ dest: "/tmp/" });
 const port = process.env.PORT || 3000;
 
-if (!process.env.TWELVE_LABS_API_KEY) {
-  console.error("❌ CRITICAL: API KEY MISSING");
+// Validate Keys
+if (!process.env.TWELVE_LABS_API_KEY || !process.env.GEMINI_API_KEY) {
+  console.error(
+    "❌ CRITICAL: MISSING API KEYS (TWELVE_LABS_API_KEY or GEMINI_API_KEY)"
+  );
   process.exit(1);
 }
 
+// Initialize Clients
 const client = new TwelveLabs({ apiKey: process.env.TWELVE_LABS_API_KEY });
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const geminiModel = genAI.getGenerativeModel({
+  model: "gemini-1.5-flash",
+  // Enforce JSON schema for perfect Swift decoding
+  generationConfig: { responseMimeType: "application/json" },
+});
+
 app.use(cors());
 app.use(express.json());
 
 let GLOBAL_INDEX_ID = null;
-const GLOBAL_INDEX_NAME = "VidScore_Server";
+const GLOBAL_INDEX_NAME = "VidScore_Hybrid_Engine";
 
-// --- 1. SETUP INDEX ---
+// --- 1. SETUP TWELVE LABS INDEX ---
 const getOrCreateGlobalIndex = async () => {
   try {
     const indexes = await client.indexes.list();
@@ -36,19 +48,13 @@ const getOrCreateGlobalIndex = async () => {
         `✅ Found existing index: ${GLOBAL_INDEX_NAME} (${GLOBAL_INDEX_ID})`
       );
     } else {
-      console.log(
-        `Index ${GLOBAL_INDEX_NAME} not found. Creating new one with Marengo 3.0...`
-      );
+      console.log(`Index ${GLOBAL_INDEX_NAME} not found. Creating new one...`);
       const newIndex = await client.indexes.create({
         indexName: GLOBAL_INDEX_NAME,
         models: [
           {
-            modelName: "marengo3.0",
+            modelName: "marengo3.0", // Or 3.0 if available to your key
             modelOptions: ["visual", "audio", "text_in_video"],
-          },
-          {
-            modelName: "pegasus1.2",
-            modelOptions: ["visual", "audio"],
           },
         ],
         addons: ["thumbnail"],
@@ -65,158 +71,38 @@ const getOrCreateGlobalIndex = async () => {
   await getOrCreateGlobalIndex();
 })();
 
-// --- 2. NICHE RULES ENGINE (HYBRID) ---
+// --- 2. NICHE RULES (Passed to Gemini) ---
 const getNicheContext = (audience) => {
-  const normalizedAudience = audience ? audience.toLowerCase() : "general";
+  const normalized = audience ? audience.toLowerCase() : "general";
 
-  // Hardcoded rules for high-value niches
-  const rules = {
-    "real estate": `
-- VISUALS: Look for high-quality wide angles, smooth drone shots, or bright interior lighting.
-- PACING: Should be elegant and smooth, not frantic.
-- HOOK: Must show the "hero shot" (front of house or best room) immediately or overlay text with price/location.
-- AUDIO: clear voiceover or trending luxury audio.
-- FAILURE POINTS: Dark lighting, shaky camera, clutter in rooms.
-`,
-    fitness: `
-- VISUALS: Needs to show physique or movement clearly.
-- PACING: Fast, energetic, cuts on the beat of the music.
-- HOOK: Needs to show the "result" (the six-pack) or the "struggle" (the heavy weight) in the first second.
-- AUDIO: High energy music or ASMR gym sounds.
-- FAILURE POINTS: Bad form, boring rest periods left in, bad camera angle.
-`,
-    tech: `
-- VISUALS: Clean desk setup, clear screen recordings, high contrast.
-- PACING: Very fast, information-dense.
-- HOOK: Show the "cool gadget" or the "final code result" immediately.
-- AUDIO: Crisp voiceover is mandatory.
-- FAILURE POINTS: Blurry screens, slow typing, monotone voice.
-`,
-    beauty: `
-- VISUALS: Perfect lighting (ring light), close-ups of texture.
-- PACING: Transitions (swipes, finger snaps) are critical.
-- HOOK: Before/After result shown instantly.
-- FAILURE POINTS: Bad color grading, messy background.
-`,
-    business: `
-- VISUALS: Talking head, but must have dynamic captions.
-- PACING: No pauses. "Millennial Pause" at start is a critical failure.
-- HOOK: A controversial statement or a specific "How to" promise.
-- FAILURE POINTS: looking away from camera, slow start, boring background.
-`,
-    pets: `
-- VISUALS: Cute close-ups, funny movements.
-- PACING: Chaos is good.
-- HOOK: The funny action must happen immediately.
-- FAILURE POINTS: Human talking too much, camera too far away.
-`,
+  const contexts = {
+    "real estate":
+      "Needs luxury aesthetic, wide steady shots, clear value proposition, elegant music.",
+    fitness:
+      "Needs high energy, clear physique/form display, fast pacing, aggressive or upbeat audio.",
+    tech: "Needs crisp 4K visuals, clear screen recordings, fast pacing, intelligent script.",
+    beauty:
+      "Needs perfect lighting (ring light), texture close-ups, before/after hook.",
+    business:
+      "Needs authority, direct eye contact, controversial or value-heavy hook, zero fluff.",
   };
 
-  // 1. Check strict hardcoded matches
-  for (const [key, value] of Object.entries(rules)) {
-    if (normalizedAudience.includes(key)) return value;
+  for (const [key, value] of Object.entries(contexts)) {
+    if (normalized.includes(key)) return value;
   }
-
-  // 2. Dynamic Handle: User typed something specific
-  if (normalizedAudience !== "general" && normalizedAudience !== "") {
-    return `
-- CONTEXT: The user explicitly stated this video is for the "${audience}" niche.
-- INSTRUCTION: Use your internal knowledge of ${audience} content on social media.
-- CRITERIA: Judge the hook, pacing, and visuals based on what currently performs well for ${audience}.
-`;
-  }
-
-  // 3. Fallback
-  return `
-- VISUALS: Clear, bright, high definition.
-- PACING: Remove all dead air and pauses.
-- HOOK: Visual movement or text overlay in first 3 seconds.
-`;
+  return "Needs high retention, strong visual hook, clear audio, and fast pacing.";
 };
 
-// --- 3. AUTO-DETECT NICHE HELPER ---
-const detectVideoNiche = async (videoId) => {
-  try {
-    // ✅ FIX: Switched from client.generate.text to client.analyze
-    const result = await client.analyze({
-      videoId: videoId,
-      prompt: `
-Analyze this video and categorize it into exactly one of these niches:
-'Real Estate', 'Fitness', 'Tech', 'Beauty', 'Business', 'Pets'.
-If it is clearly one of these, return ONLY the category name.
-If it does not fit these but has a clear theme, return that theme name (e.g. 'Cooking', 'Gaming').
-If it is unclear, return 'General'.
-`,
-      temperature: 0.1,
-    });
-
-    // Ensure we handle result.data correctly depending on SDK version
-    const detected = (result.data || result.content || "").trim();
-    console.log(`🤖 AI Auto-Detected Niche: ${detected}`);
-    return detected;
-  } catch (e) {
-    console.log("Auto-detect failed, defaulting to General. Error:", e.message);
-    return "General";
-  }
-};
-
-// --- 4. THE PROMPT ---
-const GENERATE_PREMIUM_PROMPT = (audience, platform, nicheInstructions) => `
-You are a top-tier Viral Video Consultant for ${platform} specializing in the "${audience}" niche.
-Your goal is to critique this video specifically against the standards of top performers in ${audience}.
-
-*** NICHE SPECIFIC STANDARDS FOR ${audience.toUpperCase()} ***
-${nicheInstructions}
-************************************************************
-
-Step 1: Analyze the "Hook" (0:00 to 0:03) based on the Niche Standards above.
-- Does it match the niche expectation? (e.g., Luxury Real Estate needs elegance, Fitness needs energy).
-- Is the text/visual clear?
-
-Step 2: Analyze Technical Execution.
-- Lighting, Composition, and Audio Quality compared to top ${audience} creators.
-
-Step 3: Provide Analytics.
-Generate a strict JSON response.
-Rules:
-- "hookAnalysis": Be specific to the niche. (e.g., "For a Real Estate video, this pan was too fast/shaky").
-- "virality": Compare it to viral hits in this specific category.
-
-Output format (Raw JSON only):
-{
-"overallScore": (integer 0-100),
-"hookScore": (integer 0-10),
-"visualScore": (integer 0-10),
-"audioScore": (integer 0-10),
-"audienceMatchScore": (integer 0-10),
-"predictedRetention": [100, 85, 70, 60, 50, 40],
-"hookAnalysis": {
-"status": "Weak" | "Strong",
-"timestamp": "0:00-0:03",
-"feedback": "Critique based on niche standards."
-},
-"criticalIssues": [
-"Issue 1",
-"Issue 2"
-],
-"actionableFixes": [
-"Fix 1",
-"Fix 2"
-],
-"captionSuggestion": "Viral caption relevant to niche",
-"viralPotential": "Low" | "Medium" | "High"
-}
-`;
-
+// --- 3. THE HYBRID PIPELINE ---
 app.post("/analyze-video", upload.single("video"), async (req, res) => {
   if (!req.file || !GLOBAL_INDEX_ID)
     return res.status(400).json({ error: "System not ready" });
 
   const filePath = req.file.path;
-  let { audience, platform } = req.body;
+  const { audience, platform } = req.body;
 
   try {
-    console.log(`[1] Uploading...`);
+    console.log(`[1] Uploading to Twelve Labs (The Eyes)...`);
     const task = await client.tasks.create({
       indexId: GLOBAL_INDEX_ID,
       videoFile: fs.createReadStream(filePath),
@@ -224,80 +110,132 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
 
     console.log(`[2] Processing Task: ${task.id}`);
 
-    let attempts = 0;
+    // Poll for completion
     let videoId = null;
+    let attempts = 0;
     while (attempts < 60) {
       const status = await client.tasks.retrieve(task.id);
       if (status.status === "ready") {
         videoId = status.videoId;
         break;
       }
-      if (status.status === "failed") {
-        throw new Error(
-          `Processing failed: ${status.processStatus || "Unknown error"}`
-        );
-      }
+      if (status.status === "failed")
+        throw new Error("Twelve Labs Processing Failed");
       await new Promise((r) => setTimeout(r, 2000));
       attempts++;
     }
 
     if (!videoId) throw new Error("Processing Timeout");
 
-    // --- HYBRID LOGIC ---
-    const isUserProvided =
-      audience &&
-      audience.trim() !== "" &&
-      audience.toLowerCase() !== "general" &&
-      audience.toLowerCase() !== "unknown";
+    // --- STEP A: TWELVE LABS EXTRACTION (THE PERCEPTION LAYER) ---
+    console.log(`[3] Extracting Visual Data...`);
 
-    if (!isUserProvided) {
-      console.log("[3a] No audience provided. Auto-detecting...");
-      audience = await detectVideoNiche(videoId);
-    } else {
-      console.log(`[3a] User manually specified: ${audience}`);
-    }
+    // We explicitly ask Twelve Labs to separate Dialogue from Background Audio in its description
+    const [summaryResult, gistResult] = await Promise.all([
+      client.generate.text({
+        videoId: videoId,
+        prompt: `
+          Analyze this video for a professional critique.
+          1. Describe the FIRST 3 SECONDS in detail (Visuals + Audio).
+          2. Describe the Audio Mixing: Is there spoken dialogue? Is it clear? Is there background music?
+          3. Describe the Pacing: Is it fast, slow, or inconsistent?
+          4. Describe the Visuals: Lighting quality, camera stability, color grading.
+          5. Transcribe any on-screen text.
+        `,
+        temperature: 0.1,
+      }),
+      client.gist({
+        videoId: videoId,
+        types: ["hashtag", "topic"],
+      }),
+    ]);
 
-    const nicheInstructions = getNicheContext(audience);
+    const videoFacts = summaryResult.data || summaryResult.content;
+    const detectedHashtags = gistResult.hashtags || [];
 
-    // ✅ FIX: Switched from client.generate.text to client.analyze
-    const result = await client.analyze({
-      videoId: videoId,
-      prompt: GENERATE_PREMIUM_PROMPT(audience, platform, nicheInstructions),
-      temperature: 0.2, // Low temp for JSON consistency
-    });
+    // --- STEP B: GEMINI ANALYSIS (THE LOOKSMAXXING BRAIN) ---
+    console.log(`[4] Sending Facts to Gemini (The Brain)...`);
 
-    // Handle data structure safely
-    let rawText = result.data || result.content || "";
+    const nicheContext = getNicheContext(audience);
 
-    rawText = rawText
+    const geminiPrompt = `
+      You are a specialized AI designed to "Looksmax" social media videos. 
+      Your job is to provide a brutal, stat-heavy breakdown of this video's performance potential for ${platform}.
+      
+      *** THE VIDEO FACTS (Perceived by Vision AI) ***
+      ${videoFacts}
+      ***********************************************
+
+      *** TARGET AUDIENCE STANDARDS: ${audience} ***
+      ${nicheContext}
+      **********************************************
+
+      Your Goal: Grade this video like a character stat sheet.
+      
+      SCORING CRITERIA:
+      - "potential": Your prediction of its virality (0-100).
+      - "hook": How effectively it stops scrolling in sec 0-3.
+      - "retention": Pacing score. Does it get boring?
+      - "dialogue": Clarity, delivery, and script quality (0 if no speech).
+      - "audio": Background music, SFX, and mixing quality (non-dialogue).
+      - "visuals": Aesthetic quality, lighting, and composition.
+
+      FEEDBACK SECTIONS:
+      - "strengths": What did they do right? (The "Halo Effect" qualities).
+      - "weaknesses": What is lowering their score? (The "Flaws").
+      - "tips": Actionable steps to "looksmax" this video (e.g., "Increase saturation", "Cut the pause at 0:04").
+
+      RETURN RAW JSON ONLY (No Markdown):
+      {
+        "scores": {
+          "overall": (integer 0-100),
+          "potential": (integer 0-100),
+          "hook": (integer 0-100),
+          "retention": (integer 0-100),
+          "visuals": (integer 0-100),
+          "dialogue": (integer 0-100),
+          "audio": (integer 0-100),
+          "pacing": (integer 0-100)
+        },
+        "analysis": {
+          "targetAudienceAnalysis": "Specific analysis of how well this fits the ${audience} niche.",
+          "strengths": ["Strength 1", "Strength 2"],
+          "weaknesses": ["Weakness 1", "Weakness 2"],
+          "tips": ["Tip 1", "Tip 2", "Tip 3"]
+        },
+        "metadata": {
+          "caption": "A viral-optimized caption suggestion",
+          "hashtags": ["tag1", "tag2"]
+        }
+      }
+    `;
+
+    const result = await geminiModel.generateContent(geminiPrompt);
+    const response = await result.response;
+    const text = response.text();
+
+    const cleanJson = text
       .replace(/```json/g, "")
       .replace(/```/g, "")
       .trim();
+    const analysisData = JSON.parse(cleanJson);
 
-    let analysisData;
-    try {
-      analysisData = JSON.parse(rawText);
-    } catch (e) {
-      console.error("JSON Parse Error:", rawText);
-      throw new Error("AI generated invalid format. Please try again.");
-    }
-
-    analysisData.detectedAudience = audience;
-
-    try {
-      const gistResult = await client.gist({
-        videoId: videoId,
-        types: ["hashtag", "topic"],
-      });
-      analysisData.hashtags = gistResult.hashtags || [];
-      analysisData.topics = gistResult.topics || [];
-    } catch (err) {
-      console.log("Gist generation skipped:", err.message);
-      analysisData.hashtags = [];
+    // Merge Hashtags
+    if (
+      !analysisData.metadata.hashtags ||
+      analysisData.metadata.hashtags.length < 3
+    ) {
+      analysisData.metadata.hashtags = [
+        ...detectedHashtags,
+        ...(analysisData.metadata.hashtags || []),
+      ].slice(0, 10);
     }
 
     console.log("✅ Analysis Complete");
+
+    // Cleanup
     fs.unlink(filePath, () => {});
+
     res.json(analysisData);
   } catch (error) {
     console.error("❌ Error:", error);
@@ -306,4 +244,6 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
   }
 });
 
-app.listen(port, () => console.log(`🚀 VidScore Premium Engine on ${port}`));
+app.listen(port, () =>
+  console.log(`🚀 VidScore Looksmaxxing Engine on ${port}`)
+);
