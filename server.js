@@ -238,7 +238,7 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
           "pacing": "integer (0-100)"
         },
         "analysis": {
-          "brutal_feedback": "Short, sharp summary. Mention if it met the standard for the specific niche.",
+          "targetAudienceAnalysis": "Short, sharp summary. Mention if it met the standard for the specific niche.",
           "strengths": ["list strings"],
           "weaknesses": ["list strings (be specific)"],
           "tips": ["actionable fix"]
