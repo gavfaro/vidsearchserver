@@ -211,6 +211,9 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
       === CONTEXT ===
       ${nicheContext}
 
+      CRITICAL SCORING INSTRUCTIONS:
+      - All scores MUST be integers between 0 and 100.
+
       Return JSON with: scores (overall, potential, hook, retention, visuals, dialogue, audio, pacing), analysis (targetAudienceAnalysis, strengths, weaknesses, tips), metadata (caption, hashtags).
     `;
 
