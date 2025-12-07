@@ -21,7 +21,10 @@ const tlClient = new TwelveLabs({ apiKey: process.env.TWELVE_LABS_API_KEY });
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const geminiModel = genAI.getGenerativeModel({
   model: "gemini-2.5-flash",
-  generationConfig: { responseMimeType: "application/json" },
+  generationConfig: {
+    responseMimeType: "application/json",
+    temperature: 0.2, // Low temp for analytical consistency
+  },
 });
 
 app.use(cors());
@@ -68,21 +71,6 @@ const getOrCreateGlobalIndex = async () => {
 
 (async () => await getOrCreateGlobalIndex())();
 
-const getNicheContext = (audience) => {
-  const normalized = audience ? audience.toLowerCase() : "general";
-  if (normalized.includes("real estate"))
-    return "Needs luxury aesthetic, wide steady shots, clear value proposition, elegant music.";
-  if (normalized.includes("fitness"))
-    return "Needs high energy, clear physique/form display, fast pacing, aggressive or upbeat audio.";
-  if (normalized.includes("tech"))
-    return "Needs crisp 4K visuals, clear screen recordings, fast pacing, intelligent script.";
-  if (normalized.includes("beauty"))
-    return "Needs perfect lighting, texture close-ups, before/after hook.";
-  if (normalized.includes("business"))
-    return "Needs authority, direct eye contact, value-heavy hook, zero fluff.";
-  return "Needs high retention, strong visual hook, clear audio, and fast pacing.";
-};
-
 // -----------------------------------------------------------------------------
 // 3. STREAMING ANALYZE ENDPOINT
 // -----------------------------------------------------------------------------
@@ -96,7 +84,6 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
     Connection: "keep-alive",
   });
 
-  // Helper to send events
   const sendEvent = (type, data) => {
     res.write(`data: ${JSON.stringify({ type, ...data })}\n\n`);
   };
@@ -108,11 +95,11 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
     return;
   }
 
-  const { audience = "general", platform = "TikTok" } = req.body;
+  const { audience = "General Audience", platform = "TikTok" } = req.body;
 
   try {
     // -------------------------------------------------------------------------
-    // STEP 1: INDEXING (Map to "Marengo Vision AI Scanning...") - 0.3
+    // STEP 1: INDEXING
     // -------------------------------------------------------------------------
     sendEvent("progress", {
       message: "Marengo Vision AI Scanning...",
@@ -127,7 +114,6 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
     let videoId = null;
     let pollProgress = 0.3;
 
-    // Poll for indexing completion
     for (let i = 0; i < 60; i++) {
       const status = await tlClient.tasks.retrieve(task.id);
 
@@ -138,7 +124,6 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
       if (status.status === "failed")
         throw new Error("Twelve Labs processing failed");
 
-      // Gently nudge progress bar while waiting so it feels alive
       if (pollProgress < 0.45) {
         pollProgress += 0.01;
         sendEvent("progress", {
@@ -152,7 +137,7 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
     if (!videoId) throw new Error("Processing timeout");
 
     // -------------------------------------------------------------------------
-    // STEP 2: RAW ANALYSIS (Map to "Measuring Retention Hooks...") - 0.5
+    // STEP 2: RAW ANALYSIS
     // -------------------------------------------------------------------------
     sendEvent("progress", {
       message: "Measuring Retention Hooks...",
@@ -164,19 +149,19 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
         tlClient.analyze({
           videoId,
           prompt:
-            "Analyze narrative, intent, emotions, hook effectiveness, and progression.",
-          temperature: 0.2,
-        }),
-        tlClient.analyze({
-          videoId,
-          prompt:
-            "Analyze technical execution: audio quality, lighting, camera work, editing pacing.",
+            "Analyze the narrative structure. Does the hook fail? Is the middle boring? Describe the pacing.",
           temperature: 0.1,
         }),
         tlClient.analyze({
           videoId,
-          prompt: `Analyze visual storytelling for ${audience} audience. Color palette, setting, visual hooks.`,
-          temperature: 0.2,
+          prompt:
+            "List technical attributes: audio clarity, lighting conditions, camera stability, editing style.",
+          temperature: 0.1,
+        }),
+        tlClient.analyze({
+          videoId,
+          prompt: `Analyze the visual style for a ${audience} audience.`,
+          temperature: 0.1,
         }),
         tlClient.gist({ videoId, types: ["hashtag", "topic"] }),
       ]);
@@ -190,35 +175,70 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
     const detectedHashtags = gistResult.hashtags || gistResult.topics || [];
 
     // -------------------------------------------------------------------------
-    // STEP 3: PRE-SCORING (Map to "Analyzing Audio Mixing...") - 0.7
+    // STEP 3: PRE-SCORING
     // -------------------------------------------------------------------------
-    // We have the data, just about to send to Gemini. Perfect time for this step.
     sendEvent("progress", {
       message: "Analyzing Audio Mixing...",
       progress: 0.7,
     });
 
-    const nicheContext = getNicheContext(audience);
+    // REPLACED HARDCODED LOGIC WITH DYNAMIC AI PROMPTING
     const geminiPrompt = `
-      You are a ${audience} content expert. Analyze this ${platform} video.
+      You are a VIRAL CONTENT AUDITOR. You are critical and nuanced.
       
-      === NARRATIVE ===
-      ${narrative}
-      === TECHNICAL ===
-      ${technical}
-      === VISUAL ===
-      ${visual}
-      === CONTEXT ===
-      ${nicheContext}
+      USER CONTEXT:
+      - Target Audience Input: "${audience}"
+      - Platform: "${platform}"
 
-      CRITICAL SCORING INSTRUCTIONS:
-      - All scores MUST be integers between 0 and 100.
+      === STEP 1: DEFINE THE STANDARD (INTERNAL REASONING) ===
+      Based on the specific "Target Audience Input" above, define the visual/audio standard yourself.
+      - Example A: If Audience is "Skateboarders", then "Raw/Fish-eye/Lo-fi" is GOOD.
+      - Example B: If Audience is "Luxury Watch Collectors", then "Grainy/Dark" is BAD.
+      - Example C: If Audience is "Corporate HR", then "Polished/Professional" is MANDATORY.
+      
+      Establish the standard for "${audience}" on "${platform}" right now.
+      
+      === STEP 2: ANALYZE RAW DATA ===
+      NARRATIVE: ${narrative}
+      TECHNICAL: ${technical}
+      VISUAL: ${visual}
 
-      Return JSON with: scores (overall, potential, hook, retention, visuals, dialogue, audio, pacing), analysis (targetAudienceAnalysis, strengths, weaknesses, tips), metadata (caption, hashtags).
+      === STEP 3: APPLY SCORING ===
+      Compare STEP 2 against STEP 1.
+      
+      PENALTIES:
+      1. If the video fails the SPECIFIC standard you established in Step 1, penalize heavily.
+      2. If the audio is unintelligible (universal fail), max score 60.
+      3. If the hook is boring (universal fail), max score 70.
+
+      Start Score: 50/100.
+      
+      Return JSON:
+      {
+        "scores": {
+          "overall": "integer (0-100)",
+          "potential": "integer (0-100)",
+          "hook": "integer (0-100)",
+          "retention": "integer (0-100)",
+          "visuals": "integer (0-100)",
+          "audio": "integer (0-100)",
+          "pacing": "integer (0-100)"
+        },
+        "analysis": {
+          "brutal_feedback": "Short, sharp summary. Explicitly mention if the video met the standard for '${audience}'.",
+          "strengths": ["list strings"],
+          "weaknesses": ["list strings (be specific)"],
+          "tips": ["actionable fix"]
+        },
+        "metadata": {
+          "caption": "Viral style caption",
+          "hashtags": ["tag1", "tag2"]
+        }
+      }
     `;
 
     // -------------------------------------------------------------------------
-    // STEP 4: SCORING (Map to "Calculating Viral Potential...") - 0.9
+    // STEP 4: SCORING
     // -------------------------------------------------------------------------
     sendEvent("progress", {
       message: "Calculating Viral Potential...",
@@ -228,13 +248,24 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
     const result = await geminiModel.generateContent(geminiPrompt);
     const text = result.response.text();
     const cleanJson = text.replace(/```json|```/g, "").trim();
-    const analysisData = JSON.parse(cleanJson);
+
+    let analysisData;
+    try {
+      analysisData = JSON.parse(cleanJson);
+    } catch (e) {
+      console.error("JSON Parse error", e);
+      analysisData = {
+        scores: { overall: 50 },
+        analysis: { brutal_feedback: "Error parsing AI response." },
+      };
+    }
 
     // Merge hashtags
     if (
       !analysisData.metadata?.hashtags ||
       analysisData.metadata.hashtags.length < 3
     ) {
+      analysisData.metadata = analysisData.metadata || {};
       analysisData.metadata.hashtags = [
         ...detectedHashtags,
         ...(analysisData.metadata.hashtags || []),
@@ -245,9 +276,8 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
     // STEP 5: DONE
     // -------------------------------------------------------------------------
     sendEvent("complete", { result: analysisData });
-    res.end(); // Close stream
+    res.end();
 
-    // Cleanup
     try {
       await tlClient.indexes.videos.delete(GLOBAL_INDEX_ID, videoId);
     } catch (e) {}
@@ -261,5 +291,5 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
 });
 
 app.listen(port, () =>
-  console.log(`🚀 Pegasus Engine (Streaming Mode) running on port ${port}`)
+  console.log(`🚀 Pegasus Engine (Dynamic Mode) running on port ${port}`)
 );
