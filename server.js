@@ -90,8 +90,14 @@ app.use(cors());
 app.use(express.json());
 
 // -----------------------------------------------------------------------------
-// ZOD SCHEMA FOR JSON VALIDATION
+// ZOD SCHEMA FOR JSON VALIDATION (UPDATED)
 // -----------------------------------------------------------------------------
+// We now define a reusable object for feedback items
+const feedbackItemSchema = z.object({
+  title: z.string(),
+  description: z.string(),
+});
+
 const analysisSchema = z.object({
   scores: z.object({
     overall: z.number().min(0).max(100),
@@ -105,9 +111,10 @@ const analysisSchema = z.object({
   }),
   analysis: z.object({
     targetAudienceAnalysis: z.string(),
-    strengths: z.array(z.string()),
-    weaknesses: z.array(z.string()),
-    tips: z.array(z.string()),
+    // Updated arrays to hold objects instead of strings
+    strengths: z.array(feedbackItemSchema),
+    weaknesses: z.array(feedbackItemSchema),
+    tips: z.array(feedbackItemSchema),
   }),
   metadata: z.object({
     caption: z.string(),
@@ -167,7 +174,7 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
     }
     if (!videoId) throw new Error("Processing timeout");
 
-    // STEP 2: Deep Analysis Prompt (Enhanced with Audience & Engagement Signals)
+    // STEP 2: Deep Analysis Prompt
     sendEvent("progress", {
       message: "Extracting Creative DNA...",
       progress: 0.5,
@@ -178,29 +185,18 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
 
       1. **TARGET AUDIENCE DETECTION**
          - Specify age, interests, and platform behavior.
-         - Include example creators or channels.
-         - Indicate production tolerance (what flaws they forgive or expect).
-
+      
       2. **NARRATIVE STRUCTURE AND RETENTION**
-         - Break into beats (hook, escalation, climax, resolution, CTA).
-         - Highlight engagement peaks and potential drop-off points.
-         - Evaluate emotional pacing and visual-dialogue alignment.
+         - Break into beats (hook, escalation, climax, resolution).
+         - Highlight engagement peaks.
 
       3. **CINEMATIC AND TECHNICAL CRAFT**
          - Evaluate framing, color, motion stability, lighting, editing rhythm.
-         - Diagnose causal issues (e.g., “slow pan reduces momentum”).
-         - Identify moments where production aids or hurts retention.
 
       4. **VISUAL STYLE AND BRAND COHERENCE**
-         - Assess grading, palette, typography, and on-screen design.
-         - Relate to platform norms (TikTok, YouTube Shorts, etc.).
-         - Highlight stylistic references or mismatches.
+         - Assess grading, palette, typography.
 
-      5. **ENGAGEMENT SIGNALS**
-         - Indicate when attention is likely to peak or drop.
-         - Include visual, auditory, or narrative cues impacting retention.
-
-      Use precise, diagnostic language. Avoid generic praise.
+      Use precise, diagnostic language.
     `;
 
     const [pegasusResult, gistResult] = await Promise.all([
@@ -216,7 +212,6 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
       ),
     ]);
 
-    // STEP 3: Sanitize Raw Output
     const rawAnalysisText =
       pegasusResult.data || pegasusResult.content || pegasusResult;
     const sanitizedRaw = rawAnalysisText
@@ -227,7 +222,7 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
 
     const detectedHashtags = gistResult.hashtags || gistResult.topics || [];
 
-    // STEP 4: Context-Aware Scoring
+    // STEP 4: Context-Aware Scoring (UPDATED PROMPT)
     sendEvent("progress", {
       message: "Calculating Viral Potential...",
       progress: 0.8,
@@ -243,20 +238,23 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
       === RAW VIDEO DATA ===
       "${sanitizedRaw}"
 
-      === CONTEXT WEIGHTING RULES ===
-      - Use the detected or user-specified audience to determine scoring tolerance.
-      - Raw/authentic niches: minor camera/audio flaws are forgiven.
-      - Aspirational niches: production flaws penalized more heavily.
-      - Prioritize engagement and retention over pure technical polish.
-      - Excellent quality but low engagement = limited viral potential.
-      - Poor quality but high authenticity/story = strong engagement potential.
-
       === TASK ===
-      Score each dimension and explain *why*. Identify visual, auditory, or narrative causes of strengths and weaknesses.
-      Avoid vague statements. Return valid JSON:
+      Score each dimension and provide detailed feedback.
+      
+      IMPORTANT: For 'strengths', 'weaknesses', and 'tips', you must return an ARRAY OF OBJECTS.
+      Each object must have:
+      1. "title": A short, punchy headline (3-6 words max).
+      2. "description": A detailed explanation of the point (2-3 sentences).
+
+      Return valid JSON matching this schema:
       {
         "scores": { "overall": int, "potential": int, "hook": int, "retention": int, "visuals": int, "audio": int, "pacing": int, "dialogue": int },
-        "analysis": { "targetAudienceAnalysis": string, "strengths": [string], "weaknesses": [string], "tips": [string] },
+        "analysis": { 
+            "targetAudienceAnalysis": string, 
+            "strengths": [{ "title": string, "description": string }], 
+            "weaknesses": [{ "title": string, "description": string }], 
+            "tips": [{ "title": string, "description": string }] 
+        },
         "metadata": { "caption": string, "hashtags": [string] }
       }
     `;
@@ -273,8 +271,18 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
       analysisData = analysisSchema.parse(JSON.parse(jsonText));
     } catch (err) {
       console.error("⚠️ Gemini JSON Parse Error:", err.message);
+      // Fallback with empty arrays if parsing fails
       analysisData = {
-        scores: { overall: 50 },
+        scores: {
+          overall: 50,
+          potential: 50,
+          hook: 50,
+          retention: 50,
+          visuals: 50,
+          audio: 50,
+          pacing: 50,
+          dialogue: 50,
+        },
         analysis: {
           targetAudienceAnalysis: "Error parsing AI output",
           strengths: [],
@@ -287,31 +295,6 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
 
     if (!analysisData.metadata.hashtags.length) {
       analysisData.metadata.hashtags = detectedHashtags.slice(0, 10);
-    }
-
-    // STEP 5: Optional Refinement Pass
-    sendEvent("progress", {
-      message: "Refining Creative Insights...",
-      progress: 0.9,
-    });
-
-    const refinementPrompt = `
-      You are a creative strategist. Deepen the analysis below by expanding on the specific decisions that shape retention, emotion, and style.
-      Avoid repetition. Keep JSON structure identical.
-      ${JSON.stringify(analysisData)}
-    `;
-
-    try {
-      const refinedResponse = await retryApiCall(() =>
-        geminiModel.generateContent(refinementPrompt)
-      );
-      const refinedJson = refinedResponse.response
-        .text()
-        .replace(/```json|```/g, "")
-        .trim();
-      analysisData = analysisSchema.parse(JSON.parse(refinedJson));
-    } catch (e) {
-      console.log("Refinement skipped due to JSON issues.");
     }
 
     // STEP 6: Complete
@@ -333,6 +316,6 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
 
 app.listen(port, () =>
   console.log(
-    `🚀 Pegasus Engine (Audience-Aware Enhanced Mode) running on port ${port}`
+    `🚀 Pegasus Engine (Accordion Feedback Mode) running on port ${port}`
   )
 );
