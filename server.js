@@ -4,57 +4,54 @@ import cors from "cors";
 import fs from "fs";
 import { TwelveLabs } from "twelvelabs-js";
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import { z } from "zod";
 import "dotenv/config";
 
 const app = express();
 const upload = multer({ dest: "/tmp/" });
 const port = process.env.PORT || 3000;
 
-// Validate API Keys
+// -----------------------------------------------------------------------------
+// ENVIRONMENT VALIDATION
+// -----------------------------------------------------------------------------
 if (!process.env.TWELVE_LABS_API_KEY || !process.env.GEMINI_API_KEY) {
-  console.error("❌ CRITICAL: Missing TWELVE_LABS_API_KEY or GEMINI_API_KEY");
+  console.error("❌ Missing TWELVE_LABS_API_KEY or GEMINI_API_KEY");
   process.exit(1);
 }
 
-// Initialize Clients
+// -----------------------------------------------------------------------------
+// CLIENT INITIALIZATION
+// -----------------------------------------------------------------------------
 const tlClient = new TwelveLabs({ apiKey: process.env.TWELVE_LABS_API_KEY });
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const geminiModel = genAI.getGenerativeModel({
   model: "gemini-2.5-flash",
-  generationConfig: {
-    responseMimeType: "application/json",
-    temperature: 0.2,
-  },
+  generationConfig: { responseMimeType: "application/json", temperature: 0.2 },
 });
 
-app.use(cors());
-app.use(express.json());
-
 // -----------------------------------------------------------------------------
-// HELPER: RETRY LOGIC (Exponential Backoff)
+// RETRY HELPER
 // -----------------------------------------------------------------------------
-// If the API says "429 Too Many Requests" or fails, this waits and retries.
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
 const retryApiCall = async (fn, retries = 3, delay = 1000) => {
   try {
     return await fn();
   } catch (error) {
     if (retries === 0) throw error;
-
-    // Check if it's a rate limit error (usually 429) or a temporary glitch
     const isRateLimit =
       error.response?.status === 429 || error.statusCode === 429;
-    const msg = isRateLimit ? "⚠️ Rate Limit Hit" : "⚠️ API Error";
-
-    console.log(`${msg}. Retrying in ${delay}ms...`);
+    console.log(
+      `${
+        isRateLimit ? "⚠️ Rate Limit Hit" : "⚠️ API Error"
+      }: Retrying in ${delay}ms...`
+    );
     await sleep(delay);
-    return retryApiCall(fn, retries - 1, delay * 2); // Double the delay each time
+    return retryApiCall(fn, retries - 1, delay * 2);
   }
 };
 
 // -----------------------------------------------------------------------------
-// GLOBAL SETTINGS
+// GLOBAL INDEX SETUP
 // -----------------------------------------------------------------------------
 let GLOBAL_INDEX_ID = null;
 const GLOBAL_INDEX_NAME = "VidScore_Pegasus_Engine";
@@ -76,12 +73,7 @@ const getOrCreateGlobalIndex = async () => {
     console.log(`Creating Pegasus index: ${GLOBAL_INDEX_NAME} ...`);
     const created = await tlClient.indexes.create({
       indexName: GLOBAL_INDEX_NAME,
-      models: [
-        {
-          modelName: "pegasus1.2",
-          modelOptions: ["visual", "audio"],
-        },
-      ],
+      models: [{ modelName: "pegasus1.2", modelOptions: ["visual", "audio"] }],
       addons: ["thumbnail"],
     });
 
@@ -94,13 +86,41 @@ const getOrCreateGlobalIndex = async () => {
 
 (async () => await getOrCreateGlobalIndex())();
 
+app.use(cors());
+app.use(express.json());
+
 // -----------------------------------------------------------------------------
-// 3. STREAMING ANALYZE ENDPOINT
+// ZOD SCHEMA FOR JSON VALIDATION
+// -----------------------------------------------------------------------------
+const analysisSchema = z.object({
+  scores: z.object({
+    overall: z.number().min(0).max(100),
+    potential: z.number().min(0).max(100),
+    hook: z.number().min(0).max(100),
+    retention: z.number().min(0).max(100),
+    visuals: z.number().min(0).max(100),
+    audio: z.number().min(0).max(100),
+    pacing: z.number().min(0).max(100),
+    dialogue: z.number().min(0).max(100),
+  }),
+  analysis: z.object({
+    targetAudienceAnalysis: z.string(),
+    strengths: z.array(z.string()),
+    weaknesses: z.array(z.string()),
+    tips: z.array(z.string()),
+  }),
+  metadata: z.object({
+    caption: z.string(),
+    hashtags: z.array(z.string()),
+  }),
+});
+
+// -----------------------------------------------------------------------------
+// /analyze-video ENDPOINT
 // -----------------------------------------------------------------------------
 app.post("/analyze-video", upload.single("video"), async (req, res) => {
   const filePath = req.file?.path;
 
-  // 1. Setup SSE Headers
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
@@ -122,15 +142,11 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
   const platform = req.body.platform || "TikTok";
 
   try {
-    // -------------------------------------------------------------------------
-    // STEP 1: INDEXING (With Retry)
-    // -------------------------------------------------------------------------
+    // STEP 1: Indexing
     sendEvent("progress", {
       message: "Marengo Vision AI Scanning...",
       progress: 0.3,
     });
-
-    // Wrapping task creation in retry logic just in case
     const task = await retryApiCall(() =>
       tlClient.tasks.create({
         indexId: GLOBAL_INDEX_ID,
@@ -139,54 +155,59 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
     );
 
     let videoId = null;
-    let pollProgress = 0.3;
-
     for (let i = 0; i < 60; i++) {
       const status = await retryApiCall(() => tlClient.tasks.retrieve(task.id));
-
       if (status.status === "ready") {
         videoId = status.videoId;
         break;
       }
       if (status.status === "failed")
         throw new Error("Twelve Labs processing failed");
-
-      if (pollProgress < 0.45) {
-        pollProgress += 0.01;
-        sendEvent("progress", {
-          message: "Marengo Vision AI Scanning...",
-          progress: pollProgress,
-        });
-      }
-
       await new Promise((r) => setTimeout(r, 2000));
     }
     if (!videoId) throw new Error("Processing timeout");
 
-    // -------------------------------------------------------------------------
-    // STEP 2: CONSOLIDATED RAW ANALYSIS (1 Call = 1 Credit)
-    // -------------------------------------------------------------------------
+    // STEP 2: Deep Analysis Prompt (Enhanced with Audience & Engagement Signals)
     sendEvent("progress", {
-      message: "Measuring Retention Hooks...",
+      message: "Extracting Creative DNA...",
       progress: 0.5,
     });
 
-    // OPTIMIZATION: We combine 4 prompts into 1.
-    // This saves 75% of your API usage while getting the same data.
-    const consolidatedPrompt = `
-      Please provide a comprehensive analysis of this video in four distinct sections:
-      
-      1. DETECTED AUDIENCE: Who specifically is this video for? (e.g. Gamers, Cooks, etc.)
-      2. NARRATIVE ANALYSIS: Analyze the hook, pacing, and story structure.
-      3. TECHNICAL ANALYSIS: List any flaws in audio (echo, quiet), lighting (dark, grain), or camera work.
-      4. VISUAL STYLE: Describe the aesthetic and color palette.
+    const deepPegasusPrompt = `
+      Perform an expert-level creative audit of the video. Divide your response into four sections:
+
+      1. **TARGET AUDIENCE DETECTION**
+         - Specify age, interests, and platform behavior.
+         - Include example creators or channels.
+         - Indicate production tolerance (what flaws they forgive or expect).
+
+      2. **NARRATIVE STRUCTURE AND RETENTION**
+         - Break into beats (hook, escalation, climax, resolution, CTA).
+         - Highlight engagement peaks and potential drop-off points.
+         - Evaluate emotional pacing and visual-dialogue alignment.
+
+      3. **CINEMATIC AND TECHNICAL CRAFT**
+         - Evaluate framing, color, motion stability, lighting, editing rhythm.
+         - Diagnose causal issues (e.g., “slow pan reduces momentum”).
+         - Identify moments where production aids or hurts retention.
+
+      4. **VISUAL STYLE AND BRAND COHERENCE**
+         - Assess grading, palette, typography, and on-screen design.
+         - Relate to platform norms (TikTok, YouTube Shorts, etc.).
+         - Highlight stylistic references or mismatches.
+
+      5. **ENGAGEMENT SIGNALS**
+         - Indicate when attention is likely to peak or drop.
+         - Include visual, auditory, or narrative cues impacting retention.
+
+      Use precise, diagnostic language. Avoid generic praise.
     `;
 
     const [pegasusResult, gistResult] = await Promise.all([
       retryApiCall(() =>
         tlClient.analyze({
           videoId,
-          prompt: consolidatedPrompt,
+          prompt: deepPegasusPrompt,
           temperature: 0.1,
         })
       ),
@@ -195,107 +216,109 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
       ),
     ]);
 
+    // STEP 3: Sanitize Raw Output
     const rawAnalysisText =
       pegasusResult.data || pegasusResult.content || pegasusResult;
+    const sanitizedRaw = rawAnalysisText
+      .replace(/audience.*?:.*?(general audience|unspecified)/gi, "")
+      .replace(/parameters?:.*?\n/gi, "")
+      .replace(/\b(context|system|prompt).*?:.*?\n/gi, "")
+      .trim();
+
     const detectedHashtags = gistResult.hashtags || gistResult.topics || [];
 
-    // -------------------------------------------------------------------------
-    // STEP 3: PRE-SCORING
-    // -------------------------------------------------------------------------
+    // STEP 4: Context-Aware Scoring
     sendEvent("progress", {
-      message: "Analyzing Audio Mixing...",
-      progress: 0.7,
+      message: "Calculating Viral Potential...",
+      progress: 0.8,
     });
 
     const geminiPrompt = `
-      You are a VIRAL CONTENT AUDITOR. You are critical and nuanced.
-      
+      You are a seasoned creative director and viral content auditor.
+
       === CONTEXT INPUTS ===
       1. USER PROVIDED AUDIENCE: "${userAudience}"
       2. PLATFORM: "${platform}"
 
-      === RAW VIDEO DATA (FROM VISION AI) ===
-      "${rawAnalysisText}"
+      === RAW VIDEO DATA ===
+      "${sanitizedRaw}"
 
-      === INSTRUCTIONS ===
-      1. **Extract Context:** Read the "DETECTED AUDIENCE" from the Raw Video Data above.
-      2. **Resolve Standard:** - If User Audience is "General", use the AI Detected Audience to set the quality standard.
-         - If User Audience is specific, prioritize it.
-      3. **Scoring:**
-         - Start at 50/100.
-         - Penalize if the video fails the specific quality standard for its niche (e.g. Gaming can be raw, Real Estate must be polished).
-         - Universal Fail: Unintelligible audio = Max 60. Boring Hook = Max 70.
-         - **Dialogue Evaluation:** Score based on script clarity, delivery energy, and tone appropriateness.
+      === CONTEXT WEIGHTING RULES ===
+      - Use the detected or user-specified audience to determine scoring tolerance.
+      - Raw/authentic niches: minor camera/audio flaws are forgiven.
+      - Aspirational niches: production flaws penalized more heavily.
+      - Prioritize engagement and retention over pure technical polish.
+      - Excellent quality but low engagement = limited viral potential.
+      - Poor quality but high authenticity/story = strong engagement potential.
 
-      Return JSON:
+      === TASK ===
+      Score each dimension and explain *why*. Identify visual, auditory, or narrative causes of strengths and weaknesses.
+      Avoid vague statements. Return valid JSON:
       {
-        "scores": {
-          "overall": "integer (0-100)",
-          "potential": "integer (0-100)",
-          "hook": "integer (0-100)",
-          "retention": "integer (0-100)",
-          "visuals": "integer (0-100)",
-          "audio": "integer (0-100)",
-          "pacing": "integer (0-100)",
-          "dialogue": "integer (0-100)"
-        },
-        "analysis": {
-          "targetAudienceAnalysis": "Short, sharp summary. Mention if it met the standard for the specific niche.",
-          "strengths": ["list strings"],
-          "weaknesses": ["list strings (be specific)"],
-          "tips": ["actionable fix"]
-        },
-        "metadata": {
-          "caption": "Viral style caption",
-          "hashtags": ["tag1", "tag2"]
-        }
+        "scores": { "overall": int, "potential": int, "hook": int, "retention": int, "visuals": int, "audio": int, "pacing": int, "dialogue": int },
+        "analysis": { "targetAudienceAnalysis": string, "strengths": [string], "weaknesses": [string], "tips": [string] },
+        "metadata": { "caption": string, "hashtags": [string] }
       }
     `;
 
-    // -------------------------------------------------------------------------
-    // STEP 4: SCORING
-    // -------------------------------------------------------------------------
-    sendEvent("progress", {
-      message: "Calculating Viral Potential...",
-      progress: 0.9,
-    });
-
-    // Also wrap Gemini in retry (Google APIs can be flaky under load)
-    const result = await retryApiCall(() =>
+    const geminiResponse = await retryApiCall(() =>
       geminiModel.generateContent(geminiPrompt)
     );
-    const text = result.response.text();
-    const cleanJson = text.replace(/```json|```/g, "").trim();
-
     let analysisData;
     try {
-      analysisData = JSON.parse(cleanJson);
-    } catch (e) {
-      console.error("JSON Parse error", e);
+      const jsonText = geminiResponse.response
+        .text()
+        .replace(/```json|```/g, "")
+        .trim();
+      analysisData = analysisSchema.parse(JSON.parse(jsonText));
+    } catch (err) {
+      console.error("⚠️ Gemini JSON Parse Error:", err.message);
       analysisData = {
         scores: { overall: 50 },
-        analysis: { brutal_feedback: "Error parsing AI response." },
+        analysis: {
+          targetAudienceAnalysis: "Error parsing AI output",
+          strengths: [],
+          weaknesses: [],
+          tips: [],
+        },
+        metadata: { caption: "", hashtags: [] },
       };
     }
 
-    // Merge hashtags
-    if (
-      !analysisData.metadata?.hashtags ||
-      analysisData.metadata.hashtags.length < 3
-    ) {
-      analysisData.metadata = analysisData.metadata || {};
-      analysisData.metadata.hashtags = [
-        ...detectedHashtags,
-        ...(analysisData.metadata.hashtags || []),
-      ].slice(0, 10);
+    if (!analysisData.metadata.hashtags.length) {
+      analysisData.metadata.hashtags = detectedHashtags.slice(0, 10);
     }
 
-    // -------------------------------------------------------------------------
-    // STEP 5: DONE
-    // -------------------------------------------------------------------------
+    // STEP 5: Optional Refinement Pass
+    sendEvent("progress", {
+      message: "Refining Creative Insights...",
+      progress: 0.9,
+    });
+
+    const refinementPrompt = `
+      You are a creative strategist. Deepen the analysis below by expanding on the specific decisions that shape retention, emotion, and style.
+      Avoid repetition. Keep JSON structure identical.
+      ${JSON.stringify(analysisData)}
+    `;
+
+    try {
+      const refinedResponse = await retryApiCall(() =>
+        geminiModel.generateContent(refinementPrompt)
+      );
+      const refinedJson = refinedResponse.response
+        .text()
+        .replace(/```json|```/g, "")
+        .trim();
+      analysisData = analysisSchema.parse(JSON.parse(refinedJson));
+    } catch (e) {
+      console.log("Refinement skipped due to JSON issues.");
+    }
+
+    // STEP 6: Complete
     sendEvent("complete", { result: analysisData });
     res.end();
 
+    // Cleanup
     try {
       await tlClient.indexes.videos.delete(GLOBAL_INDEX_ID, videoId);
     } catch (e) {}
@@ -309,5 +332,7 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
 });
 
 app.listen(port, () =>
-  console.log(`🚀 Pegasus Engine (Efficient Mode) running on port ${port}`)
+  console.log(
+    `🚀 Pegasus Engine (Audience-Aware Enhanced Mode) running on port ${port}`
+  )
 );
