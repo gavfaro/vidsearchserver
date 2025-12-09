@@ -151,7 +151,7 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
   try {
     // STEP 1: Indexing
     sendEvent("progress", {
-      message: "Marengo Vision AI Scanning...",
+      message: "AI Vision Scanning...",
       progress: 0.3,
     });
     const task = await retryApiCall(() =>
