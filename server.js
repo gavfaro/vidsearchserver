@@ -2,132 +2,133 @@ import express from "express";
 import multer from "multer";
 import cors from "cors";
 import fs from "fs";
-import { TwelveLabs } from "twelvelabs-js";
-import { GoogleGenerativeAI } from "@google/generative-ai";
-import { z } from "zod";
+import { GoogleGenerativeAI, SchemaType } from "@google/generative-ai";
+import { GoogleAIFileManager, FileState } from "@google/generative-ai/server";
 import "dotenv/config";
 
 const app = express();
 const upload = multer({ dest: "/tmp/" });
 const port = process.env.PORT || 3000;
 
-// -----------------------------------------------------------------------------
-// ENVIRONMENT VALIDATION
-// -----------------------------------------------------------------------------
-if (!process.env.TWELVE_LABS_API_KEY || !process.env.GEMINI_API_KEY) {
-  console.error("❌ Missing TWELVE_LABS_API_KEY or GEMINI_API_KEY");
+// MARK: - API Key Validation
+if (!process.env.GEMINI_API_KEY) {
+  console.error("❌ Missing GEMINI_API_KEY in .env");
   process.exit(1);
 }
 
-// -----------------------------------------------------------------------------
-// CLIENT INITIALIZATION
-// -----------------------------------------------------------------------------
-const tlClient = new TwelveLabs({ apiKey: process.env.TWELVE_LABS_API_KEY });
+// MARK: - Client Initialization
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const geminiModel = genAI.getGenerativeModel({
-  model: "gemini-2.5-flash",
-  generationConfig: { responseMimeType: "application/json", temperature: 0.2 },
-});
+const fileManager = new GoogleAIFileManager(process.env.GEMINI_API_KEY);
 
-// -----------------------------------------------------------------------------
-// RETRY HELPER
-// -----------------------------------------------------------------------------
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const retryApiCall = async (fn, retries = 3, delay = 1000) => {
-  try {
-    return await fn();
-  } catch (error) {
-    if (retries === 0) throw error;
-    const isRateLimit =
-      error.response?.status === 429 || error.statusCode === 429;
-    console.log(
-      `${
-        isRateLimit ? "⚠️ Rate Limit Hit" : "⚠️ API Error"
-      }: Retrying in ${delay}ms...`
-    );
-    await sleep(delay);
-    return retryApiCall(fn, retries - 1, delay * 2);
-  }
-};
-
-// -----------------------------------------------------------------------------
-// GLOBAL INDEX SETUP
-// -----------------------------------------------------------------------------
-let GLOBAL_INDEX_ID = null;
-const GLOBAL_INDEX_NAME = "VidScore_Pegasus_Engine";
-
-const getOrCreateGlobalIndex = async () => {
-  try {
-    const indexes = await tlClient.indexes.list();
-    const list = Array.isArray(indexes) ? indexes : indexes?.data || [];
-    const existing = list.find((i) => i.indexName === GLOBAL_INDEX_NAME);
-
-    if (existing) {
-      GLOBAL_INDEX_ID = existing.id;
-      console.log(
-        `✅ Found Pegasus index: ${GLOBAL_INDEX_NAME} (${GLOBAL_INDEX_ID})`
-      );
-      return;
-    }
-
-    console.log(`Creating Pegasus index: ${GLOBAL_INDEX_NAME} ...`);
-    const created = await tlClient.indexes.create({
-      indexName: GLOBAL_INDEX_NAME,
-      models: [{ modelName: "pegasus1.2", modelOptions: ["visual", "audio"] }],
-      addons: ["thumbnail"],
-    });
-
-    GLOBAL_INDEX_ID = created.id;
-    console.log(`✅ Created Pegasus index: ${GLOBAL_INDEX_ID}`);
-  } catch (err) {
-    console.error("❌ Index setup error:", err.message);
-  }
-};
-
-(async () => await getOrCreateGlobalIndex())();
-
+// MARK: - Middleware
 app.use(cors());
 app.use(express.json());
 
-// -----------------------------------------------------------------------------
-// ZOD SCHEMA FOR JSON VALIDATION (UPDATED)
-// -----------------------------------------------------------------------------
-// We now define a reusable object for feedback items
-const feedbackItemSchema = z.object({
-  title: z.string(),
-  description: z.string(),
+// MARK: - Helper Functions
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Supported MIME types from Gemini Docs
+const SUPPORTED_VIDEO_MIME_TYPES = [
+  "video/mp4",
+  "video/mpeg",
+  "video/mov",
+  "video/avi",
+  "video/x-flv",
+  "video/mpg",
+  "video/webm",
+  "video/wmv",
+  "video/3gpp",
+];
+
+// MARK: - Schema Definitions (Gemini)
+const metricScoreSchema = {
+  type: SchemaType.OBJECT,
+  properties: {
+    key: {
+      type: SchemaType.STRING,
+      description: "The internal key identifier provided in the prompt",
+    },
+    label: {
+      type: SchemaType.STRING,
+      description: "The human readable name of the metric",
+    },
+    score: { type: SchemaType.INTEGER, description: "The score from 0-100" },
+    reason: {
+      type: SchemaType.STRING,
+      description:
+        "A short explanation (10-15 words) of why this score was given",
+    },
+  },
+  required: ["key", "label", "score"],
+};
+
+const responseSchema = {
+  type: SchemaType.OBJECT,
+  properties: {
+    scores: {
+      type: SchemaType.ARRAY,
+      items: metricScoreSchema,
+    },
+    analysis: {
+      type: SchemaType.OBJECT,
+      properties: {
+        overallScore: { type: SchemaType.INTEGER },
+        targetAudienceAnalysis: { type: SchemaType.STRING },
+        strengths: {
+          type: SchemaType.ARRAY,
+          items: {
+            type: SchemaType.OBJECT,
+            properties: {
+              title: { type: SchemaType.STRING },
+              description: { type: SchemaType.STRING },
+            },
+          },
+        },
+        weaknesses: {
+          type: SchemaType.ARRAY,
+          items: {
+            type: SchemaType.OBJECT,
+            properties: {
+              title: { type: SchemaType.STRING },
+              description: { type: SchemaType.STRING },
+            },
+          },
+        },
+        tips: {
+          type: SchemaType.ARRAY,
+          items: {
+            type: SchemaType.OBJECT,
+            properties: {
+              title: { type: SchemaType.STRING },
+              description: { type: SchemaType.STRING },
+            },
+          },
+        },
+      },
+    },
+    metadata: {
+      type: SchemaType.OBJECT,
+      properties: {
+        caption: { type: SchemaType.STRING },
+        hashtags: {
+          type: SchemaType.ARRAY,
+          items: { type: SchemaType.STRING },
+        },
+      },
+    },
+  },
+};
+
+// MARK: - Routes
+app.get("/", (req, res) => {
+  res.send("VidScore Server Running (Gemini 2.5 Vision) 🚀");
 });
 
-const analysisSchema = z.object({
-  scores: z.object({
-    overall: z.number().min(0).max(100),
-    potential: z.number().min(0).max(100),
-    hook: z.number().min(0).max(100),
-    retention: z.number().min(0).max(100),
-    visuals: z.number().min(0).max(100),
-    audio: z.number().min(0).max(100),
-    pacing: z.number().min(0).max(100),
-    dialogue: z.number().min(0).max(100),
-  }),
-  analysis: z.object({
-    targetAudienceAnalysis: z.string(),
-    // Updated arrays to hold objects instead of strings
-    strengths: z.array(feedbackItemSchema),
-    weaknesses: z.array(feedbackItemSchema),
-    tips: z.array(feedbackItemSchema),
-  }),
-  metadata: z.object({
-    caption: z.string(),
-    hashtags: z.array(z.string()),
-  }),
-});
-
-// -----------------------------------------------------------------------------
-// /analyze-video ENDPOINT
-// -----------------------------------------------------------------------------
 app.post("/analyze-video", upload.single("video"), async (req, res) => {
   const filePath = req.file?.path;
+  const mimeType = req.file?.mimetype;
 
+  // Initialize SSE
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
@@ -138,184 +139,165 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
     res.write(`data: ${JSON.stringify({ type, ...data })}\n\n`);
   };
 
-  if (!req.file || !GLOBAL_INDEX_ID) {
-    sendEvent("error", { message: "System not ready or missing video file" });
+  if (!req.file || !filePath) {
+    sendEvent("error", { message: "Missing video file" });
     res.end();
-    if (filePath) fs.unlink(filePath, () => {});
     return;
   }
 
-  const userAudience = req.body.audience || "General Audience";
-  const platform = req.body.platform || "TikTok";
+  // Validate File Type
+  if (mimeType && !SUPPORTED_VIDEO_MIME_TYPES.includes(mimeType)) {
+    // Fallback for generic binary/octet-stream if mostly likely video, otherwise warn
+    console.warn(
+      `Warning: Uploaded mimeType ${mimeType} is not explicitly in supported list, attempting generic video/mp4 fallback.`
+    );
+  }
 
   try {
-    // STEP 1: Indexing
-    sendEvent("progress", {
-      message: "AI Vision Scanning...",
-      progress: 0.3,
-    });
-    const task = await retryApiCall(() =>
-      tlClient.tasks.create({
-        indexId: GLOBAL_INDEX_ID,
-        videoFile: fs.createReadStream(filePath),
-      })
-    );
+    // 1. Parse Context Inputs
+    const userAudience = req.body.audience || "General Audience";
+    const platform = req.body.platform || "TikTok";
+    const customSystemPrompt =
+      req.body.system_prompt || "Analyze for viral potential.";
 
-    let videoId = null;
-    for (let i = 0; i < 60; i++) {
-      const status = await retryApiCall(() => tlClient.tasks.retrieve(task.id));
-      if (status.status === "ready") {
-        videoId = status.videoId;
-        break;
+    // 2. Parse Dynamic Metrics
+    let customMetrics = [];
+    if (req.body.metric_context) {
+      try {
+        customMetrics = JSON.parse(req.body.metric_context);
+      } catch (e) {
+        console.error("Failed to parse metric_context", e);
       }
-      if (status.status === "failed")
-        throw new Error("Twelve Labs processing failed");
-      await new Promise((r) => setTimeout(r, 2000));
     }
-    if (!videoId) throw new Error("Processing timeout");
 
-    // STEP 2: Deep Analysis Prompt
+    if (customMetrics.length === 0) {
+      customMetrics = [
+        {
+          key: "potential",
+          name: "Viral Potential",
+          context: "Likelihood of sharing",
+        },
+        { key: "hook", name: "Hook", context: "First 3 seconds impact" },
+      ];
+    }
+
+    // 3. Upload Video to Gemini File Manager
     sendEvent("progress", {
-      message: "Extracting Creative DNA...",
-      progress: 0.5,
+      message: "Uploading to Gemini 2.5...",
+      progress: 0.2,
     });
 
-    const deepPegasusPrompt = `
-      Perform an expert-level creative audit of the video. Divide your response into four sections:
-
-      1. **TARGET AUDIENCE DETECTION**
-         - Specify age, interests, and platform behavior.
-      
-      2. **NARRATIVE STRUCTURE AND RETENTION**
-         - Break into beats (hook, escalation, climax, resolution).
-         - Highlight engagement peaks.
-
-      3. **CINEMATIC AND TECHNICAL CRAFT**
-         - Evaluate framing, color, motion stability, lighting, editing rhythm.
-
-      4. **VISUAL STYLE AND BRAND COHERENCE**
-         - Assess grading, palette, typography.
-
-      Use precise, diagnostic language.
-    `;
-
-    const [pegasusResult, gistResult] = await Promise.all([
-      retryApiCall(() =>
-        tlClient.analyze({
-          videoId,
-          prompt: deepPegasusPrompt,
-          temperature: 0.1,
-        })
-      ),
-      retryApiCall(() =>
-        tlClient.gist({ videoId, types: ["hashtag", "topic"] })
-      ),
-    ]);
-
-    const rawAnalysisText =
-      pegasusResult.data || pegasusResult.content || pegasusResult;
-    const sanitizedRaw = rawAnalysisText
-      .replace(/audience.*?:.*?(general audience|unspecified)/gi, "")
-      .replace(/parameters?:.*?\n/gi, "")
-      .replace(/\b(context|system|prompt).*?:.*?\n/gi, "")
-      .trim();
-
-    const detectedHashtags = gistResult.hashtags || gistResult.topics || [];
-
-    // STEP 4: Context-Aware Scoring (UPDATED PROMPT)
-    sendEvent("progress", {
-      message: "Calculating Viral Potential...",
-      progress: 0.8,
+    const uploadResult = await fileManager.uploadFile(filePath, {
+      // Use the detected mimeType or fallback to mp4
+      mimeType: mimeType || "video/mp4",
+      displayName: `VidScore_${Date.now()}`,
     });
+
+    const fileUri = uploadResult.file.uri;
+    const fileName = uploadResult.file.name;
+
+    console.log(`Uploaded file: ${fileName} (${fileUri})`);
+
+    // 4. Wait for Processing
+    sendEvent("progress", {
+      message: "Processing video frames...",
+      progress: 0.4,
+    });
+
+    let fileState = uploadResult.file.state;
+    while (fileState === FileState.PROCESSING) {
+      await sleep(2000); // Check every 2 seconds
+      const fileStatus = await fileManager.getFile(fileName);
+      fileState = fileStatus.state;
+      console.log(`File processing status: ${fileState}`);
+
+      if (fileState === FileState.FAILED) {
+        throw new Error("Video processing failed on Gemini servers.");
+      }
+    }
+
+    sendEvent("progress", {
+      message: "Analyzing with Gemini 2.5...",
+      progress: 0.7,
+    });
+
+    // 5. Construct Prompt
+    const metricInstructions = customMetrics
+      .map(
+        (m) =>
+          `- Metric Key: "${m.key}"\n   - Display Name: "${m.name}"\n   - Evaluation Logic: ${m.context}`
+      )
+      .join("\n");
 
     const geminiPrompt = `
-      You are a seasoned creative director and viral content auditor.
-
-      === CONTEXT INPUTS ===
-      1. USER PROVIDED AUDIENCE: "${userAudience}"
-      2. PLATFORM: "${platform}"
-
-      === RAW VIDEO DATA ===
-      "${sanitizedRaw}"
-
-      === TASK ===
-      Score each dimension and provide detailed feedback.
+      You are an expert creative director for social media.
       
-      IMPORTANT: For 'strengths', 'weaknesses', and 'tips', you must return an ARRAY OF OBJECTS.
-      Each object must have:
-      1. "title": A short, punchy headline (3-6 words max).
-      2. "description": A detailed explanation of the point (2-3 sentences).
+      === YOUR GOAL ===
+      ${customSystemPrompt}
 
-      Return valid JSON matching this schema:
-      {
-        "scores": { "overall": int, "potential": int, "hook": int, "retention": int, "visuals": int, "audio": int, "pacing": int, "dialogue": int },
-        "analysis": { 
-            "targetAudienceAnalysis": string, 
-            "strengths": [{ "title": string, "description": string }], 
-            "weaknesses": [{ "title": string, "description": string }], 
-            "tips": [{ "title": string, "description": string }] 
-        },
-        "metadata": { "caption": string, "hashtags": [string] }
-      }
+      === CONTEXT ===
+      Target Audience: "${userAudience}"
+      Platform: "${platform}"
+
+      === SCORING TASKS ===
+      Watch the attached video carefully.
+      Evaluate the video based on the following CUSTOM METRICS.
+      You MUST return an array in the JSON output under "scores", maintaining the exact "key" identifiers provided below.
+
+      ${metricInstructions}
+
+      === INSTRUCTIONS ===
+      1. Analyze the video visuals, audio, and pacing against the metric logic.
+      2. Provide a score (0-100) and a short reasoning for each metric.
+      3. Generate an overall analysis, strengths, weaknesses, and tips.
+      4. Suggest a caption and hashtags.
+      5. Output pure JSON matching the schema.
     `;
 
-    const geminiResponse = await retryApiCall(() =>
-      geminiModel.generateContent(geminiPrompt)
-    );
-    let analysisData;
-    try {
-      const jsonText = geminiResponse.response
-        .text()
-        .replace(/```json|```/g, "")
-        .trim();
-      analysisData = analysisSchema.parse(JSON.parse(jsonText));
-    } catch (err) {
-      console.error("⚠️ Gemini JSON Parse Error:", err.message);
-      // Fallback with empty arrays if parsing fails
-      analysisData = {
-        scores: {
-          overall: 50,
-          potential: 50,
-          hook: 50,
-          retention: 50,
-          visuals: 50,
-          audio: 50,
-          pacing: 50,
-          dialogue: 50,
-        },
-        analysis: {
-          targetAudienceAnalysis: "Error parsing AI output",
-          strengths: [],
-          weaknesses: [],
-          tips: [],
-        },
-        metadata: { caption: "", hashtags: [] },
-      };
-    }
+    // 6. Call Gemini
+    // UPDATED: Using gemini-2.5-flash per documentation
+    const model = genAI.getGenerativeModel({
+      model: "gemini-2.5-flash",
+      generationConfig: {
+        responseMimeType: "application/json",
+        responseSchema: responseSchema,
+      },
+    });
 
-    if (!analysisData.metadata.hashtags.length) {
-      analysisData.metadata.hashtags = detectedHashtags.slice(0, 10);
-    }
+    const result = await model.generateContent([
+      {
+        fileData: {
+          mimeType: uploadResult.file.mimeType,
+          fileUri: fileUri,
+        },
+      },
+      { text: geminiPrompt },
+    ]);
 
-    // STEP 6: Complete
-    sendEvent("complete", { result: analysisData });
+    const responseText = result.response.text();
+    const finalJson = JSON.parse(responseText);
+
+    // 7. Complete
+    sendEvent("complete", { result: finalJson });
     res.end();
 
-    // Cleanup
-    try {
-      await tlClient.indexes.videos.delete(GLOBAL_INDEX_ID, videoId);
-    } catch (e) {}
-    fs.unlink(filePath, () => {});
+    // Cleanup local temp file
+    if (filePath && fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+
+    // Optional: Delete from Google Servers to save storage
+    // await fileManager.deleteFile(fileName);
   } catch (err) {
-    console.error("❌ Error:", err);
-    sendEvent("error", { message: err.message || "Analysis failed" });
+    console.error("Server Error:", err);
+    sendEvent("error", { message: err.message || "Internal Server Error" });
     res.end();
-    if (fs.existsSync(filePath)) fs.unlink(filePath, () => {});
+
+    // Cleanup temp file if exists
+    if (filePath && fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
   }
 });
 
-app.listen(port, () =>
-  console.log(
-    `🚀 Pegasus Engine (Accordion Feedback Mode) running on port ${port}`
-  )
-);
+app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
