@@ -121,7 +121,7 @@ const responseSchema = {
 
 // MARK: - Routes
 app.get("/", (req, res) => {
-  res.send("VidScore Server Running (Gemini 2.5 Vision) 🚀");
+  res.send("Scanning Video 🚀");
 });
 
 app.post("/analyze-video", upload.single("video"), async (req, res) => {
@@ -183,7 +183,7 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
 
     // 3. Upload Video to Gemini File Manager
     sendEvent("progress", {
-      message: "Uploading to Gemini 2.5...",
+      message: "Preparing Video...",
       progress: 0.2,
     });
 
@@ -217,7 +217,7 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
     }
 
     sendEvent("progress", {
-      message: "Analyzing with Gemini 2.5...",
+      message: "Analyzing with AI Vision...",
       progress: 0.7,
     });
 
