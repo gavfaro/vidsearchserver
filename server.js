@@ -147,20 +147,18 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
 
   // Validate File Type
   if (mimeType && !SUPPORTED_VIDEO_MIME_TYPES.includes(mimeType)) {
-    // Fallback for generic binary/octet-stream if mostly likely video, otherwise warn
     console.warn(
       `Warning: Uploaded mimeType ${mimeType} is not explicitly in supported list, attempting generic video/mp4 fallback.`
     );
   }
 
   try {
-    // 1. Parse Context Inputs
+    // 1. Parse Inputs
     const userAudience = req.body.audience || "General Audience";
     const platform = req.body.platform || "TikTok";
     const customSystemPrompt =
       req.body.system_prompt || "Analyze for viral potential.";
 
-    // 2. Parse Dynamic Metrics
     let customMetrics = [];
     if (req.body.metric_context) {
       try {
@@ -181,14 +179,14 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
       ];
     }
 
-    // 3. Upload Video to Gemini File Manager
+    // 2. Upload Video to Gemini File Manager
+    // Starting slightly higher since upload to server is done
     sendEvent("progress", {
-      message: "Preparing Video...",
-      progress: 0.2,
+      message: "Sending to AI Engine...",
+      progress: 0.1,
     });
 
     const uploadResult = await fileManager.uploadFile(filePath, {
-      // Use the detected mimeType or fallback to mp4
       mimeType: mimeType || "video/mp4",
       displayName: `VidScore_${Date.now()}`,
     });
@@ -198,15 +196,28 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
 
     console.log(`Uploaded file: ${fileName} (${fileUri})`);
 
-    // 4. Wait for Processing
+    // 3. Wait for Processing (Dynamic Progress)
+    // We increment this from 0.2 up to 0.6 while waiting
+    let fileState = uploadResult.file.state;
+    let processingProgress = 0.2;
+
     sendEvent("progress", {
-      message: "Processing video frames...",
-      progress: 0.4,
+      message: "AI is watching video...",
+      progress: processingProgress,
     });
 
-    let fileState = uploadResult.file.state;
     while (fileState === FileState.PROCESSING) {
       await sleep(2000); // Check every 2 seconds
+
+      // Increment progress slightly to show activity, cap at 0.6
+      if (processingProgress < 0.6) {
+        processingProgress += 0.05;
+        sendEvent("progress", {
+          message: "AI is processing frames...",
+          progress: Number(processingProgress.toFixed(2)),
+        });
+      }
+
       const fileStatus = await fileManager.getFile(fileName);
       fileState = fileStatus.state;
       console.log(`File processing status: ${fileState}`);
@@ -216,12 +227,12 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
       }
     }
 
+    // 4. Construct Prompt
     sendEvent("progress", {
-      message: "Analyzing with AI Vision...",
-      progress: 0.7,
+      message: "Drafting analysis...",
+      progress: 0.65,
     });
 
-    // 5. Construct Prompt
     const metricInstructions = customMetrics
       .map(
         (m) =>
@@ -254,8 +265,6 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
       5. Output pure JSON matching the schema.
     `;
 
-    // 6. Call Gemini
-    // UPDATED: Using gemini-2.5-flash per documentation
     const model = genAI.getGenerativeModel({
       model: "gemini-2.5-flash",
       generationConfig: {
@@ -264,7 +273,9 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
       },
     });
 
-    const result = await model.generateContent([
+    // 5. Generate Content with STREAMING
+    // This allows us to tick progress (0.7 -> 0.9) as tokens generate
+    const resultStream = await model.generateContentStream([
       {
         fileData: {
           mimeType: uploadResult.file.mimeType,
@@ -274,26 +285,42 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
       { text: geminiPrompt },
     ]);
 
-    const responseText = result.response.text();
-    const finalJson = JSON.parse(responseText);
+    let fullResponseText = "";
+    let chunkCount = 0;
+    let generationProgress = 0.7;
+
+    for await (const chunk of resultStream.stream) {
+      const chunkText = chunk.text();
+      fullResponseText += chunkText;
+      chunkCount++;
+
+      // Update progress every few chunks to avoid flooding the client
+      // Cap at 0.95 so we don't hit 100% prematurely
+      if (chunkCount % 2 === 0 && generationProgress < 0.95) {
+        generationProgress += 0.02;
+        sendEvent("progress", {
+          message: "Generating insights...",
+          progress: Number(generationProgress.toFixed(2)),
+        });
+      }
+    }
+
+    // 6. Parse Final JSON
+    const finalJson = JSON.parse(fullResponseText);
 
     // 7. Complete
     sendEvent("complete", { result: finalJson });
     res.end();
 
-    // Cleanup local temp file
+    // Cleanup
     if (filePath && fs.existsSync(filePath)) {
       fs.unlinkSync(filePath);
     }
-
-    // Optional: Delete from Google Servers to save storage
-    // await fileManager.deleteFile(fileName);
   } catch (err) {
     console.error("Server Error:", err);
     sendEvent("error", { message: err.message || "Internal Server Error" });
     res.end();
 
-    // Cleanup temp file if exists
     if (filePath && fs.existsSync(filePath)) {
       fs.unlinkSync(filePath);
     }
