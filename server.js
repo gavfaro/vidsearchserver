@@ -7,15 +7,8 @@ import { GoogleAIFileManager, FileState } from "@google/generative-ai/server";
 import "dotenv/config";
 
 const app = express();
+const upload = multer({ dest: "/tmp/" });
 const port = process.env.PORT || 3000;
-
-// MARK: - 1. Configure Multer with 50MB Limit
-const upload = multer({
-  dest: "/tmp/",
-  limits: {
-    fileSize: 50 * 1024 * 1024, // 50MB in bytes
-  },
-});
 
 // MARK: - API Key Validation
 if (!process.env.GEMINI_API_KEY) {
@@ -33,30 +26,6 @@ app.use(express.json());
 
 // MARK: - Helper Functions
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-// MARK: - Upload Middleware Wrapper
-// This catches the "File Too Large" error before it crashes the request
-const uploadMiddleware = (req, res, next) => {
-  const uploadSingle = upload.single("video");
-
-  uploadSingle(req, res, (err) => {
-    if (err instanceof multer.MulterError) {
-      // A Multer error occurred when uploading.
-      if (err.code === "LIMIT_FILE_SIZE") {
-        return res.status(413).json({
-          error: "File too large. Maximum size is 50MB.",
-          type: "limit_error",
-        });
-      }
-      return res.status(400).json({ error: err.message });
-    } else if (err) {
-      // An unknown error occurred when uploading.
-      return res.status(500).json({ error: "Upload failed: " + err.message });
-    }
-    // Everything went fine.
-    next();
-  });
-};
 
 // Supported MIME types from Gemini Docs
 const SUPPORTED_VIDEO_MIME_TYPES = [
@@ -155,8 +124,7 @@ app.get("/", (req, res) => {
   res.send("VidScore Server Running (Gemini 2.5 Vision) 🚀");
 });
 
-// UPDATED: Using 'uploadMiddleware' instead of 'upload.single("video")' directly
-app.post("/analyze-video", uploadMiddleware, async (req, res) => {
+app.post("/analyze-video", upload.single("video"), async (req, res) => {
   const filePath = req.file?.path;
   const mimeType = req.file?.mimetype;
 
